@@ -594,6 +594,9 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, proje
         inp.close()
         return i, (native_w, native_h)
 
+    user_masks_dir = os.path.join(project_dir, 'user_masks')
+    os.makedirs(user_masks_dir, exist_ok=True)
+
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = {executor.submit(process_frame, i, path): i for i, path in enumerate(exr_files)}
         completed = 0
@@ -612,11 +615,21 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, proje
     def get_master_mask(frame_idx, proxy_mask):
         native_w, native_h = native_sizes[frame_idx]
         upscaled_mask = cv2.resize(proxy_mask, (native_w, native_h), interpolation=cv2.INTER_NEAREST)
+        
         alpha_path = os.path.join(alphas_dir, f"alpha_{frame_idx:05d}.png")
         if os.path.exists(alpha_path):
             alpha_img = cv2.imread(alpha_path, cv2.IMREAD_GRAYSCALE)
             if alpha_img is not None:
-                return cv2.bitwise_or(upscaled_mask, alpha_img)
+                upscaled_mask = cv2.bitwise_or(upscaled_mask, alpha_img)
+                
+        um_path = os.path.join(user_masks_dir, f"umask_{frame_idx:05d}.png")
+        if os.path.exists(um_path):
+            um_img = cv2.imread(um_path, cv2.IMREAD_GRAYSCALE)
+            if um_img is not None:
+                if um_img.shape != upscaled_mask.shape:
+                    um_img = cv2.resize(um_img, (upscaled_mask.shape[1], upscaled_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+                upscaled_mask = cv2.bitwise_or(upscaled_mask, um_img)
+                
         return upscaled_mask
 
     def save_mask(frame_idx, master_mask):
@@ -736,7 +749,38 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, proje
                     progress = int(((out_frame_idx + 1) / len(exr_files)) * 100)
                     res_queue.put({"status": "gen_progress", "value": progress})
                     
-            res_queue.put({"status": "generation_done"})
+            res_queue.put({"status": "gen_done"})
+            
+        elif action == "ingest_custom_masks":
+            mask_files = cmd.get("mask_files")
+            clicks = cmd.get("clicks")
+            print("[Daemon] Ingesting custom user masks...", flush=True)
+            
+            def ingest_mask(i, um_path_in):
+                um_path_out = os.path.join(user_masks_dir, f"umask_{i:05d}.png")
+                um_img = cv2.imread(um_path_in, cv2.IMREAD_GRAYSCALE)
+                if um_img is not None:
+                    # Binarize to ensure 0 or 255
+                    um_img = (um_img > 127).astype(np.uint8) * 255
+                    cv2.imwrite(um_path_out, um_img)
+                    
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = {executor.submit(ingest_mask, i, path): i for i, path in enumerate(mask_files)}
+                completed = 0
+                for future in concurrent.futures.as_completed(futures):
+                    completed += 1
+                    if completed % 5 == 0:
+                        progress = int((completed / len(mask_files)) * 50)
+                        res_queue.put({"status": "gen_progress", "value": progress})
+                        
+            print("[Daemon] Re-simulating sequence to bake masks...", flush=True)
+            for out_frame_idx in range(len(exr_files)):
+                simulate_frame(out_frame_idx, clicks)
+                if out_frame_idx % 5 == 0:
+                    progress = 50 + int(((out_frame_idx + 1) / len(exr_files)) * 50)
+                    res_queue.put({"status": "gen_progress", "value": progress})
+            
+            res_queue.put({"status": "gen_done"})
             
         elif action == "exit_and_cleanup":
             print("\n[Daemon] Received exit command. Executing VRAM cleanup protocol...", flush=True)
@@ -778,6 +822,10 @@ class MainWindow(QMainWindow):
         self.masking_tab = QWidget()
         self.tabs.addTab(self.masking_tab, "Masking")
         self.init_masking_tab()
+        
+        self.solve_tab = QWidget()
+        self.tabs.addTab(self.solve_tab, "Solve")
+        self.init_solve_tab()
         
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
@@ -878,11 +926,15 @@ class MainWindow(QMainWindow):
         self.btn_gen_mask = QPushButton("Generate Masks (Sequence)")
         self.btn_gen_mask.clicked.connect(self.generate_sequence_masks)
         
-        self.btn_start_solve = QPushButton("Start 3D Solver (Cleanup VRAM)")
-        self.btn_start_solve.clicked.connect(self.shutdown_daemon)
+        self.btn_load_user_mask = QPushButton("Load Custom Mask Sequence (JPG/PNG)")
+        self.btn_load_user_mask.clicked.connect(self.load_custom_masks)
         
+        self.lbl_user_mask_status = QLabel("No custom masks loaded")
+        self.lbl_user_mask_status.setStyleSheet("color: gray;")
+        
+        ctrl_layout.addWidget(self.btn_load_user_mask)
+        ctrl_layout.addWidget(self.lbl_user_mask_status)
         ctrl_layout.addWidget(self.btn_gen_mask)
-        ctrl_layout.addWidget(self.btn_start_solve)
         layout.addLayout(ctrl_layout)
         
         self.progress_bar = QProgressBar()
@@ -890,6 +942,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress_bar)
         
         self.masking_tab.setLayout(layout)
+
+    def init_solve_tab(self):
+        layout = QVBoxLayout()
+        self.btn_start_solve = QPushButton("Start 3D Solver (Cleanup VRAM)")
+        self.btn_start_solve.clicked.connect(self.shutdown_daemon)
+        layout.addWidget(self.btn_start_solve)
+        layout.addStretch()
+        self.solve_tab.setLayout(layout)
 
     def get_color_space(self):
         return self.combo_colorspace.currentText()
@@ -923,6 +983,11 @@ class MainWindow(QMainWindow):
                 self.setup_viewer.update_sequence(self.exr_files, cs, self.project_dir)
                 self.masking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
                 
+                um_path = os.path.join(self.project_dir, 'user_masks', "umask_00000.png")
+                if os.path.exists(um_path):
+                    self.lbl_user_mask_status.setText("Custom Masks Loaded (from project)")
+                    self.lbl_user_mask_status.setStyleSheet("color: white;")
+                    
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load EXR sequence: {str(e)}")
 
@@ -1007,9 +1072,12 @@ class MainWindow(QMainWindow):
                 elif status == "gen_done":
                     self.progress_bar.setValue(100)
                     self.btn_gen_mask.setEnabled(True)
+                    if hasattr(self, 'btn_load_user_mask'):
+                        self.btn_load_user_mask.setEnabled(True)
                     fetch_qpixmap.cache_clear()
                     self.masking_viewer.on_frame_changed(self.masking_viewer.slider.value())
-                    QMessageBox.information(self, "Finished", "Mask Sequence Generated!")
+                    self.masking_viewer.set_loading_state(False)
+                    QMessageBox.information(self, "Finished", "Sequence Generation Complete!")
                     
                 elif status == "cleanup_done":
                     self.daemon_process.join()
@@ -1018,6 +1086,34 @@ class MainWindow(QMainWindow):
                     QMessageBox.information(self, "Cleanup Complete", "VRAM Cleared! Ready for CoTracker3.")
             except queue.Empty:
                 pass
+                
+    def load_custom_masks(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Custom Mask Sequence Folder", "")
+        if not dir_path: return
+        
+        valid_exts = {'.jpg', '.jpeg', '.png'}
+        files = [os.path.join(dir_path, f) for f in os.listdir(dir_path) if os.path.splitext(f.lower())[1] in valid_exts]
+        if not files:
+            QMessageBox.warning(self, "Warning", "No JPG/PNG files found in the selected folder.")
+            return
+            
+        files.sort()
+        if len(files) != len(self.exr_files):
+            QMessageBox.warning(self, "Count Mismatch", f"You selected a folder with {len(files)} mask files, but there are {len(self.exr_files)} EXR frames. They must match.")
+            return
+            
+        if self.daemon_process and self.daemon_process.is_alive():
+            self.lbl_user_mask_status.setText(f"Loaded: {os.path.basename(files[0])}...")
+            self.lbl_user_mask_status.setStyleSheet("color: white;")
+            self.btn_load_user_mask.setEnabled(False)
+            self.btn_gen_mask.setEnabled(False)
+            self.progress_bar.setValue(0)
+            self.masking_viewer.set_loading_state(True)
+            self.cmd_queue.put({
+                "action": "ingest_custom_masks",
+                "mask_files": files,
+                "clicks": self.masking_viewer.click_data
+            })
 
 if __name__ == '__main__':
     expected_exe = os.path.abspath(os.path.join(os.getcwd(), 'python', 'python.exe'))
