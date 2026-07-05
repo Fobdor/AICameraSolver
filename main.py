@@ -25,8 +25,8 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 # Models Dictionary
 MODELS = {
     "sam2_hiera_large.pt": "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt",
-    "cotracker3.pth": "placeholder",
-    "vggsfm.ckpt": "placeholder"
+    "cotracker3/scaled_offline.pth": "https://huggingface.co/facebook/cotracker3/resolve/main/scaled_offline.pth",
+    "vggsfm/vggsfm_v2_0_0.bin": "https://huggingface.co/facebook/VGGSfM/resolve/main/vggsfm_v2_0_0.bin"
 }
 
 # Color Space Constants
@@ -150,6 +150,7 @@ class DownloadWorker(QThread):
             for i, model_name in enumerate(items_to_download):
                 url = MODELS[model_name]
                 out_path = os.path.join(MODELS_DIR, model_name)
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
                 
                 def reporthook(count, block_size, total_size):
                     if total_size > 0:
