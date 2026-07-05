@@ -78,12 +78,17 @@ def fetch_qpixmap(frame_path, color_space, mask_path=None, mask_mtime=0):
                 if mask_img.shape != (height, width):
                     mask_img = cv2.resize(mask_img, (width, height), interpolation=cv2.INTER_NEAREST)
                 
-                red_overlay = np.zeros_like(rgb_uint8)
-                red_overlay[:, :] = [200, 20, 40] # Ruby Red
+                lut = np.zeros((256, 3), dtype=np.uint8)
+                lut[255] = [200, 20, 40] # Ruby Red for alpha
+                for obj_id in range(1, 100):
+                    hue = (obj_id * 137.508) % 360
+                    color = QColor.fromHsv(int(hue), 255, 255)
+                    lut[obj_id] = [color.red(), color.green(), color.blue()]
+                    
+                colored_mask = lut[mask_img]
+                mask_bool = mask_img > 0
                 
-                alpha = 0.45
-                mask_bool = mask_img > 127
-                blended = cv2.addWeighted(rgb_uint8, 1 - alpha, red_overlay, alpha, 0)
+                blended = cv2.addWeighted(rgb_uint8, 1 - 0.45, colored_mask, 0.45, 0)
                 rgb_uint8[mask_bool] = blended[mask_bool]
 
         bytes_per_line = 3 * width
@@ -107,10 +112,18 @@ def fetch_proxy_qpixmap(proxy_path, mask_path=None, mask_mtime=0):
             mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if mask_img is not None:
                 mask_img = cv2.resize(mask_img, (proxy_img.shape[1], proxy_img.shape[0]), interpolation=cv2.INTER_NEAREST)
-                red_overlay = np.zeros_like(proxy_img)
-                red_overlay[:, :] = [200, 20, 40]
-                mask_bool = mask_img > 127
-                blended = cv2.addWeighted(proxy_img, 1 - 0.45, red_overlay, 0.45, 0)
+                
+                lut = np.zeros((256, 3), dtype=np.uint8)
+                lut[255] = [200, 20, 40] # Ruby Red for alpha
+                for obj_id in range(1, 100):
+                    hue = (obj_id * 137.508) % 360
+                    color = QColor.fromHsv(int(hue), 255, 255)
+                    lut[obj_id] = [color.red(), color.green(), color.blue()]
+                    
+                colored_mask = lut[mask_img]
+                mask_bool = mask_img > 0
+                
+                blended = cv2.addWeighted(proxy_img, 1 - 0.45, colored_mask, 0.45, 0)
                 proxy_img[mask_bool] = blended[mask_bool]
                 
         h, w, c = proxy_img.shape
@@ -667,11 +680,17 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, proje
                             )
                         if uf == f_idx:
                             final_mask_logits = out_mask_logits
+                            final_obj_ids = out_obj_ids
                 
                 if final_mask_logits is not None:
-                    # Union of all objects tracked on this frame
-                    mask = np.any((final_mask_logits.cpu().numpy() > 0.0), axis=(0, 1)).astype(np.uint8) * 255
-                    save_mask(f_idx, get_master_mask(f_idx, mask))
+                    proxy_mask = None
+                    for i, obj_id in enumerate(final_obj_ids):
+                        mask_bool = (final_mask_logits[i, 0].cpu().numpy() > 0.0)
+                        if proxy_mask is None:
+                            proxy_mask = np.zeros(mask_bool.shape, dtype=np.uint8)
+                        proxy_mask[mask_bool] = obj_id
+                    if proxy_mask is not None:
+                        save_mask(f_idx, get_master_mask(f_idx, proxy_mask))
             else:
                 simulate_frame(f_idx, clicks)
                 
@@ -685,15 +704,27 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, proje
                 with ctx:
                     print("[Daemon] Forward pass...", flush=True)
                     for out_frame_idx, out_obj_ids, out_mask_logits in sam_model.propagate_in_video(inference_state, reverse=False):
-                        mask = np.any((out_mask_logits.cpu().numpy() > 0.0), axis=(0, 1)).astype(np.uint8) * 255
-                        save_mask(out_frame_idx, get_master_mask(out_frame_idx, mask))
+                        proxy_mask = None
+                        for i, obj_id in enumerate(out_obj_ids):
+                            mask_bool = (out_mask_logits[i, 0].cpu().numpy() > 0.0)
+                            if proxy_mask is None:
+                                proxy_mask = np.zeros(mask_bool.shape, dtype=np.uint8)
+                            proxy_mask[mask_bool] = obj_id
+                        if proxy_mask is not None:
+                            save_mask(out_frame_idx, get_master_mask(out_frame_idx, proxy_mask))
                         progress = int(((out_frame_idx + 1) / len(exr_files)) * 50)
                         res_queue.put({"status": "gen_progress", "value": progress})
                         
                     print("[Daemon] Backward pass...", flush=True)
                     for out_frame_idx, out_obj_ids, out_mask_logits in sam_model.propagate_in_video(inference_state, reverse=True):
-                        mask = np.any((out_mask_logits.cpu().numpy() > 0.0), axis=(0, 1)).astype(np.uint8) * 255
-                        save_mask(out_frame_idx, get_master_mask(out_frame_idx, mask))
+                        proxy_mask = None
+                        for i, obj_id in enumerate(out_obj_ids):
+                            mask_bool = (out_mask_logits[i, 0].cpu().numpy() > 0.0)
+                            if proxy_mask is None:
+                                proxy_mask = np.zeros(mask_bool.shape, dtype=np.uint8)
+                            proxy_mask[mask_bool] = obj_id
+                        if proxy_mask is not None:
+                            save_mask(out_frame_idx, get_master_mask(out_frame_idx, proxy_mask))
                         progress = 50 + int(((len(exr_files) - out_frame_idx) / len(exr_files)) * 50)
                         res_queue.put({"status": "gen_progress", "value": progress})
                         
