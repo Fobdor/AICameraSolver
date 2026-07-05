@@ -93,6 +93,34 @@ def fetch_qpixmap(frame_path, color_space, mask_path=None):
         print(f"Failed to fetch qpixmap: {e}")
         return QPixmap()
 
+@functools.lru_cache(maxsize=200)
+def fetch_proxy_qpixmap(proxy_path, mask_path=None):
+    try:
+        if not os.path.exists(proxy_path):
+            return QPixmap()
+            
+        proxy_img = cv2.imread(proxy_path)
+        if proxy_img is None: return QPixmap()
+        proxy_img = cv2.cvtColor(proxy_img, cv2.COLOR_BGR2RGB)
+        
+        if mask_path and os.path.exists(mask_path):
+            mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask_img is not None:
+                mask_img = cv2.resize(mask_img, (proxy_img.shape[1], proxy_img.shape[0]), interpolation=cv2.INTER_NEAREST)
+                red_overlay = np.zeros_like(proxy_img)
+                red_overlay[:, :] = [200, 20, 40]
+                mask_bool = mask_img > 127
+                blended = cv2.addWeighted(proxy_img, 1 - 0.45, red_overlay, 0.45, 0)
+                proxy_img[mask_bool] = blended[mask_bool]
+                
+        h, w, c = proxy_img.shape
+        bytes_per_line = 3 * w
+        qimg = QImage(proxy_img.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+        return QPixmap.fromImage(qimg)
+    except Exception as e:
+        print(f"Failed to fetch proxy qpixmap: {e}")
+        return QPixmap()
+
 class DownloadWorker(QThread):
     progress = Signal(int)
     finished = Signal()
@@ -174,6 +202,16 @@ class ClickableGraphicsView(QGraphicsView):
                 x, y = int(item_pos.x()), int(item_pos.y())
                 frame_idx = self.parent_widget.slider.value()
                 
+                if self.parent_widget.interactive and hasattr(self.parent_widget, 'native_size') and self.parent_widget.native_size != (0,0):
+                    proxy_w = self.parent_widget.pixmap_item.pixmap().width()
+                    native_w, native_h = self.parent_widget.native_size
+                    if proxy_w > 0 and proxy_w != native_w:
+                        proxy_h = self.parent_widget.pixmap_item.pixmap().height()
+                        scale_w = native_w / proxy_w
+                        scale_h = native_h / proxy_h
+                        x = int(x * scale_w)
+                        y = int(y * scale_h)
+
                 if event.button() == Qt.LeftButton:
                     self.parent_widget.add_click(x, y, frame_idx, 1, self.parent_widget.spin_obj.value()) # 1 = Positive
                 elif event.button() == Qt.RightButton:
@@ -194,6 +232,7 @@ class SequenceViewerWidget(QWidget):
         self.project_dir = None
         self.interactive = interactive
         self.show_overlay = False
+        self.native_size = (0, 0)
         
         # [(x, y, frame_idx, type, obj_id), ...] where type: 1=pos, 0=neg
         self.click_data = []
@@ -299,7 +338,15 @@ class SequenceViewerWidget(QWidget):
 
     def remove_closest_click(self, x, y, frame_idx):
         if not self.click_data: return
-        # Find closest point in current frame
+        
+        # Dynamic distance threshold based on zoom/proxy state
+        threshold = 30
+        if hasattr(self, 'native_size') and self.native_size != (0,0) and self.pixmap_item:
+            proxy_w = self.pixmap_item.pixmap().width()
+            native_w = self.native_size[0]
+            if proxy_w > 0 and proxy_w != native_w:
+                threshold = 30 * (native_w / proxy_w)
+                
         closest_idx = -1
         min_dist = float('inf')
         for i, (cx, cy, f_idx, ptype, obj_id) in enumerate(self.click_data):
@@ -309,7 +356,7 @@ class SequenceViewerWidget(QWidget):
                     min_dist = dist
                     closest_idx = i
         
-        if closest_idx != -1 and min_dist < 30: # 30px radius threshold
+        if closest_idx != -1 and min_dist < threshold:
             removed = self.click_data.pop(closest_idx)
             print(f"Removed point {removed}")
             self.save_clicks()
@@ -329,6 +376,13 @@ class SequenceViewerWidget(QWidget):
         self.color_space = color_space
         self.project_dir = project_dir
         if self.exr_files:
+            try:
+                inp = oiio.ImageInput.open(self.exr_files[0])
+                self.native_size = (inp.spec().width, inp.spec().height)
+                inp.close()
+            except Exception:
+                pass
+                
             clicks_file = os.path.join(self.project_dir, 'clicks.json')
             if os.path.exists(clicks_file):
                 try:
@@ -376,7 +430,14 @@ class SequenceViewerWidget(QWidget):
             base_name = os.path.splitext(os.path.basename(frame_path))[0]
             mask_path = os.path.join(self.project_dir, 'masks', f"{base_name}_mask.png")
             
-        base_pixmap = fetch_qpixmap(frame_path, self.color_space, mask_path)
+        base_pixmap = QPixmap()
+        if self.interactive and self.project_dir:
+            proxy_path = os.path.join(self.project_dir, 'proxies', f"{index:05d}.jpg")
+            if os.path.exists(proxy_path):
+                base_pixmap = fetch_proxy_qpixmap(proxy_path, mask_path)
+                
+        if base_pixmap.isNull():
+            base_pixmap = fetch_qpixmap(frame_path, self.color_space, mask_path)
         
         if base_pixmap.isNull():
             return
@@ -385,8 +446,21 @@ class SequenceViewerWidget(QWidget):
             display_pixmap = QPixmap(base_pixmap)
             painter = QPainter(display_pixmap)
             
+            # scaling ratios if using proxies
+            scale_x, scale_y = 1.0, 1.0
+            if self.native_size != (0,0):
+                native_w, native_h = self.native_size
+                proxy_w = display_pixmap.width()
+                proxy_h = display_pixmap.height()
+                if proxy_w > 0 and proxy_w != native_w:
+                    scale_x = proxy_w / native_w
+                    scale_y = proxy_h / native_h
+            
             for cx, cy, f_idx, ptype, obj_id in self.click_data:
                 if f_idx == index:
+                    draw_x = int(cx * scale_x)
+                    draw_y = int(cy * scale_y)
+                    
                     if ptype == 1:
                         hue = (obj_id * 137.508) % 360
                         color = QColor.fromHsv(int(hue), 255, 255)
@@ -396,7 +470,7 @@ class SequenceViewerWidget(QWidget):
                         color = QColor("red")
                         painter.setPen(QPen(color, 4))
                         painter.setBrush(color)
-                    painter.drawEllipse(QPointF(cx, cy), 6, 6)
+                    painter.drawEllipse(QPointF(draw_x, draw_y), 6, 6)
             painter.end()
             final_pixmap = display_pixmap
         else:
