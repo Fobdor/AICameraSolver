@@ -52,7 +52,7 @@ def apply_color_space(rgb_array, color_space):
     return srgb
 
 @functools.lru_cache(maxsize=50)
-def fetch_qpixmap(frame_path, color_space, mask_path=None):
+def fetch_qpixmap(frame_path, color_space, mask_path=None, mask_mtime=0):
     try:
         input_image = oiio.ImageInput.open(frame_path)
         if not input_image:
@@ -94,7 +94,7 @@ def fetch_qpixmap(frame_path, color_space, mask_path=None):
         return QPixmap()
 
 @functools.lru_cache(maxsize=200)
-def fetch_proxy_qpixmap(proxy_path, mask_path=None):
+def fetch_proxy_qpixmap(proxy_path, mask_path=None, mask_mtime=0):
     try:
         if not os.path.exists(proxy_path):
             return QPixmap()
@@ -426,18 +426,21 @@ class SequenceViewerWidget(QWidget):
         frame_path = self.exr_files[index]
         
         mask_path = None
+        mask_mtime = 0
         if self.show_overlay and self.project_dir:
             base_name = os.path.splitext(os.path.basename(frame_path))[0]
             mask_path = os.path.join(self.project_dir, 'masks', f"{base_name}_mask.png")
+            if os.path.exists(mask_path):
+                mask_mtime = os.path.getmtime(mask_path)
             
         base_pixmap = QPixmap()
         if self.interactive and self.project_dir:
             proxy_path = os.path.join(self.project_dir, 'proxies', f"{index:05d}.jpg")
             if os.path.exists(proxy_path):
-                base_pixmap = fetch_proxy_qpixmap(proxy_path, mask_path)
+                base_pixmap = fetch_proxy_qpixmap(proxy_path, mask_path, mask_mtime)
                 
         if base_pixmap.isNull():
-            base_pixmap = fetch_qpixmap(frame_path, self.color_space, mask_path)
+            base_pixmap = fetch_qpixmap(frame_path, self.color_space, mask_path, mask_mtime)
         
         if base_pixmap.isNull():
             return
@@ -680,18 +683,28 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, proje
                 is_cuda = (device.type == 'cuda')
                 ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if is_cuda else contextlib.nullcontext()
                 with ctx:
-                    for out_frame_idx, out_obj_ids, out_mask_logits in sam_model.propagate_in_video(inference_state):
-                        # Union of all masks tracked
+                    print("[Daemon] Forward pass...", flush=True)
+                    for out_frame_idx, out_obj_ids, out_mask_logits in sam_model.propagate_in_video(inference_state, reverse=False):
                         mask = np.any((out_mask_logits.cpu().numpy() > 0.0), axis=(0, 1)).astype(np.uint8) * 255
                         save_mask(out_frame_idx, get_master_mask(out_frame_idx, mask))
-                        progress = int(((out_frame_idx + 1) / len(exr_files)) * 100)
-                        res_queue.put({"status": "progress", "value": progress})
+                        progress = int(((out_frame_idx + 1) / len(exr_files)) * 50)
+                        res_queue.put({"status": "gen_progress", "value": progress})
+                        
+                    print("[Daemon] Backward pass...", flush=True)
+                    for out_frame_idx, out_obj_ids, out_mask_logits in sam_model.propagate_in_video(inference_state, reverse=True):
+                        mask = np.any((out_mask_logits.cpu().numpy() > 0.0), axis=(0, 1)).astype(np.uint8) * 255
+                        save_mask(out_frame_idx, get_master_mask(out_frame_idx, mask))
+                        progress = 50 + int(((len(exr_files) - out_frame_idx) / len(exr_files)) * 50)
+                        res_queue.put({"status": "gen_progress", "value": progress})
+                        
+                res_queue.put({"status": "gen_progress", "value": 100})
             else:
                 clicks = cmd.get("clicks")
-                for i in range(len(exr_files)):
-                    simulate_frame(i, clicks)
-                    progress = int(((i + 1) / len(exr_files)) * 100)
-                    res_queue.put({"status": "progress", "value": progress})
+                for out_frame_idx in range(len(exr_files)):
+                    simulate_frame(out_frame_idx, clicks)
+                    progress = int(((out_frame_idx + 1) / len(exr_files)) * 100)
+                    res_queue.put({"status": "gen_progress", "value": progress})
+                    
             res_queue.put({"status": "generation_done"})
             
         elif action == "exit_and_cleanup":
@@ -957,10 +970,10 @@ class MainWindow(QMainWindow):
                         self.progress_bar.setValue(0)
                         self.masking_viewer.set_loading_state(False)
                 
-                elif status == "progress":
+                elif status == "gen_progress":
                     self.progress_bar.setValue(res.get("value"))
                     
-                elif status == "generation_done":
+                elif status == "gen_done":
                     self.progress_bar.setValue(100)
                     self.btn_gen_mask.setEnabled(True)
                     fetch_qpixmap.cache_clear()
