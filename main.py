@@ -564,7 +564,16 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, proje
                 
             if needs_alpha:
                 alpha_uint8 = np.clip(image_data[:, :, 3] * 255.0, 0, 255).astype(np.uint8)
+                # Invert alpha: user specifies black is masked out. We need White=Excluded for SAM 2 logic.
+                alpha_uint8 = 255 - alpha_uint8
                 cv2.imwrite(alpha_path, alpha_uint8)
+                
+        if has_alpha:
+            base_name = os.path.splitext(os.path.basename(frame_path))[0]
+            mask_path_out = os.path.join(masks_dir, f"{base_name}_mask.png")
+            if not os.path.exists(mask_path_out) and os.path.exists(alpha_path):
+                import shutil
+                shutil.copy(alpha_path, mask_path_out)
                 
         inp.close()
         return i, (native_w, native_h)
@@ -591,8 +600,7 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, proje
         if os.path.exists(alpha_path):
             alpha_img = cv2.imread(alpha_path, cv2.IMREAD_GRAYSCALE)
             if alpha_img is not None:
-                norm_alpha = alpha_img.astype(np.float32) / 255.0
-                return (upscaled_mask * norm_alpha).astype(np.uint8)
+                return cv2.bitwise_or(upscaled_mask, alpha_img)
         return upscaled_mask
 
     def save_mask(frame_idx, master_mask):
