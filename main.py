@@ -847,23 +847,11 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
     sample_interval = 10
     
     sample_frames = list(range(0, num_frames, sample_interval))
-    if not sample_frames:
-        sample_frames = [0]
-        
-    points_per_frame = max(1, max_points // len(sample_frames))
-    
-    queries = []
     masks_dir = os.path.join(project_dir, 'masks')
     
-    print(f"[TrackingWorker] Sampling {points_per_frame} points per frame for {len(sample_frames)} frames...", flush=True)
-    # Sample from the mask union across sample frames to find robustly trackable pixels,
-    # but assign all queries to frame 0 so all points are active from the very first frame.
-    # This guarantees a flat, consistent point count across the entire timeline.
-    combined_valid_x = []
-    combined_valid_y = []
-    
-    for t in sample_frames:
-        mask_path = os.path.join(masks_dir, f"{os.path.splitext(os.path.basename(exr_files[t]))[0]}_mask.png")
+    def sample_queries_from_mask(target_frame, max_samples, query_time=0):
+        """Samples queries from the unmasked areas of a specific frame."""
+        mask_path = os.path.join(masks_dir, f"{os.path.splitext(os.path.basename(exr_files[target_frame]))[0]}_mask.png")
         if os.path.exists(mask_path):
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         else:
@@ -874,91 +862,127 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
         else:
             valid_y, valid_x = np.mgrid[0:native_h, 0:native_w]
             valid_y, valid_x = valid_y.flatten(), valid_x.flatten()
+            
+        queries_list = []
+        if len(valid_x) > 0:
+            num_samples = min(max_samples, len(valid_x))
+            indices = np.random.choice(len(valid_x), num_samples, replace=False)
+            for idx in indices:
+                queries_list.append([query_time, valid_x[idx] / scale_x, valid_y[idx] / scale_y])
+        return queries_list
+
+    def stream_inference(queries_list, reverse=False, pass_name="Pass"):
+        """Runs the online predictor over the sequence, optionally in reverse."""
+        if not queries_list:
+            print(f"[TrackingWorker] {pass_name}: No valid queries. Skipping.", flush=True)
+            return None, None
+            
+        queries_tensor = torch.tensor(queries_list, dtype=torch.float32, device=device).unsqueeze(0)
+        window_len = cotracker_model.model.window_len
+        num_chunks = max(1, math.ceil((num_frames - window_len) / step) + 1)
         
-        combined_valid_x.append(valid_x)
-        combined_valid_y.append(valid_y)
+        def read_chunk(start, length):
+            chunk = torch.empty((1, length, 3, proxy_h, proxy_w), dtype=torch.float32, device='cpu')
+            for j in range(length):
+                rel_idx = min(start + j, num_frames - 1)
+                # If reverse is True, map relative index to real index from the end of the sequence
+                real_idx = (num_frames - 1 - rel_idx) if reverse else rel_idx
+                proxy_path = os.path.join(proxies_dir, f"{real_idx:05d}.jpg")
+                proxy_img = cv2.imread(proxy_path)
+                proxy_img = cv2.cvtColor(proxy_img, cv2.COLOR_BGR2RGB)
+                rgb_chw = np.transpose(proxy_img.astype(np.float32), (2, 0, 1))
+                chunk[0, j] = torch.from_numpy(rgb_chw)
+            return chunk.to(device, dtype=torch.float16)
+
+        print(f"[TrackingWorker] {pass_name}: Starting inference ({num_frames} frames, reverse={reverse})...", flush=True)
+        pred_tracks, pred_visibility = None, None
+        
+        with torch.inference_mode():
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                for chunk_idx in range(num_chunks):
+                    start_f = chunk_idx * step
+                    chunk_tensor = read_chunk(start_f, window_len)
+                    
+                    if chunk_idx == 0:
+                        cotracker_model(chunk_tensor, is_first_step=True, queries=queries_tensor)
+                    
+                    pred_tracks, pred_visibility = cotracker_model(chunk_tensor, is_first_step=False)
+                    del chunk_tensor
+                    
+        if pred_tracks is None:
+            return None, None
+            
+        # Trim padded frames
+        pred_tracks = pred_tracks[:, :num_frames]
+        pred_visibility = pred_visibility[:, :num_frames]
+        
+        # If reversed, flip the time dimension back to normal
+        if reverse:
+            pred_tracks = torch.flip(pred_tracks, dims=[1])
+            pred_visibility = torch.flip(pred_visibility, dims=[1])
+            
+        return pred_tracks, pred_visibility
+
+    # --- Multi-Pass Execution ---
+    all_tracks = []
+    all_vis = []
     
-    if combined_valid_x:
-        all_x = np.concatenate(combined_valid_x)
-        all_y = np.concatenate(combined_valid_y)
-        # Deduplicate coordinate pairs
-        coords = np.unique(np.stack([all_x, all_y], axis=1), axis=0)
-        all_x, all_y = coords[:, 0], coords[:, 1]
+    # Distribute the 4096 budget across passes (up to 4 passes)
+    points_per_pass = max_points // 4
+
+    def add_pass_results(t_data, v_data):
+        if t_data is not None:
+            all_tracks.append(t_data)
+            all_vis.append(v_data)
+
+    # Pass 1: Forward Tracking from Frame 0
+    q_fwd = sample_queries_from_mask(target_frame=0, max_samples=points_per_pass, query_time=0)
+    t_fwd, v_fwd = stream_inference(q_fwd, reverse=False, pass_name="Pass 1 (Forward)")
+    add_pass_results(t_fwd, v_fwd)
+    res_queue.put({"status": "track_progress", "value": 30})
+
+    # Pass 2: Backward Tracking from Last Frame
+    q_bwd = sample_queries_from_mask(target_frame=num_frames - 1, max_samples=points_per_pass, query_time=0)
+    t_bwd, v_bwd = stream_inference(q_bwd, reverse=True, pass_name="Pass 2 (Backward)")
+    add_pass_results(t_bwd, v_bwd)
+    res_queue.put({"status": "track_progress", "value": 50})
+
+    # Check density and run Mid-Sequence passes if needed
+    if all_vis:
+        temp_vis = torch.cat(all_vis, dim=2).squeeze(0).cpu().numpy()
+        active_counts = np.sum(temp_vis, axis=1)  # (T,)
         
-        num_samples = min(max_points, len(all_x))
-        chosen = np.random.choice(len(all_x), num_samples, replace=False)
-        for idx in chosen:
-            # All queries at frame 0 — gives consistent point count on every frame
-            queries.append([0, all_x[idx] / scale_x, all_y[idx] / scale_y])
-                
-    if not queries:
-        res_queue.put({"status": "error", "message": "No valid trackable points found across the sequence."})
+        THRESHOLD = max_points * 0.35  # If density drops below 35% of max budget
+        min_active = np.min(active_counts)
+        
+        if min_active < THRESHOLD:
+            worst_frame = np.argmin(active_counts)
+            print(f"[TrackingWorker] Density dropped to {min_active} points at frame {worst_frame}. Spawning Pass 3 & 4...", flush=True)
+            
+            # Pass 3: Forward from worst_frame
+            q_mid_fwd = sample_queries_from_mask(target_frame=worst_frame, max_samples=points_per_pass, query_time=worst_frame)
+            t_mid_fwd, v_mid_fwd = stream_inference(q_mid_fwd, reverse=False, pass_name=f"Pass 3 (Mid-Fwd F{worst_frame})")
+            add_pass_results(t_mid_fwd, v_mid_fwd)
+            res_queue.put({"status": "track_progress", "value": 65})
+            
+            # Pass 4: Backward from worst_frame
+            rev_worst_frame = num_frames - 1 - worst_frame
+            q_mid_bwd = sample_queries_from_mask(target_frame=worst_frame, max_samples=points_per_pass, query_time=rev_worst_frame)
+            t_mid_bwd, v_mid_bwd = stream_inference(q_mid_bwd, reverse=True, pass_name=f"Pass 4 (Mid-Bwd F{worst_frame})")
+            add_pass_results(t_mid_bwd, v_mid_bwd)
+            
+    res_queue.put({"status": "track_progress", "value": 80})
+
+    if not all_tracks:
+        res_queue.put({"status": "error", "message": "No valid tracks generated from any pass."})
         return
         
-    queries_tensor = torch.tensor(queries, dtype=torch.float32, device=device)
-    queries_tensor = queries_tensor.unsqueeze(0)  # (1, N, 3)
+    # Merge passes along the point dimension (dim=2 for tensor shape (1, T, N, 2))
+    merged_tracks = torch.cat(all_tracks, dim=2)
+    merged_vis = torch.cat(all_vis, dim=2)
     
-    # 3. Streaming Online Inference — window_len frames on GPU at a time, sliding by step
-    window_len = cotracker_model.model.window_len  # 16
-    print(f"[TrackingWorker] Starting streaming inference ({num_frames} frames, window={window_len}, step={step})...", flush=True)
-    
-    # Number of sliding window positions
-    num_chunks = max(1, math.ceil((num_frames - window_len) / step) + 1)
-    
-    pred_tracks = None
-    pred_visibility = None
-    
-    def read_chunk(start, length):
-        """Read `length` frames from disk starting at `start`, padding if needed."""
-        chunk = torch.empty((1, length, 3, proxy_h, proxy_w), dtype=torch.float32, device='cpu')
-        for j in range(length):
-            f_idx = min(start + j, num_frames - 1)  # clamp to last frame for padding
-            proxy_path = os.path.join(proxies_dir, f"{f_idx:05d}.jpg")
-            proxy_img = cv2.imread(proxy_path)
-            proxy_img = cv2.cvtColor(proxy_img, cv2.COLOR_BGR2RGB)
-            rgb_chw = np.transpose(proxy_img.astype(np.float32), (2, 0, 1))
-            chunk[0, j] = torch.from_numpy(rgb_chw)
-        return chunk.to(device, dtype=torch.float16)
-    
-    with torch.inference_mode():
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
-            for chunk_idx in range(num_chunks):
-                start_f = chunk_idx * step
-                
-                # Read a full window_len chunk
-                chunk_tensor = read_chunk(start_f, window_len)
-                
-                if chunk_idx == 0:
-                    # First call: initialize online processing and pass queries
-                    cotracker_model(
-                        chunk_tensor, 
-                        is_first_step=True, 
-                        queries=queries_tensor
-                    )
-                
-                # Process the chunk
-                pred_tracks, pred_visibility = cotracker_model(
-                    chunk_tensor, 
-                    is_first_step=False
-                )
-                
-                # Free this chunk immediately
-                del chunk_tensor
-                
-                progress = int(20 + (chunk_idx / num_chunks) * 60)
-                res_queue.put({"status": "track_progress", "value": progress})
-                print(f"[TrackingWorker] Chunk {chunk_idx+1}/{num_chunks} done. VRAM: {torch.cuda.memory_allocated() / (1024**2):.0f} MB", flush=True)
-    
-    if pred_tracks is None:
-        res_queue.put({"status": "error", "message": "CoTracker3 produced no tracks."})
-        return
-    
-    # Trim padded frames if necessary — online predictor accumulates all frames
-    pred_tracks = pred_tracks[:, :num_frames]
-    pred_visibility = pred_visibility[:, :num_frames]
-    
-    tracks_np = pred_tracks.squeeze(0).cpu().numpy()
-    vis_np = pred_visibility.squeeze(0).cpu().numpy()
+    tracks_np = merged_tracks.squeeze(0).cpu().numpy()
+    vis_np = merged_vis.squeeze(0).cpu().numpy()
     
     res_queue.put({"status": "track_progress", "value": 85})
     
