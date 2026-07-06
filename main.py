@@ -27,7 +27,7 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 # Models Dictionary
 MODELS = {
     "sam2_hiera_large.pt": "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt",
-    "cotracker3/scaled_offline.pth": "https://huggingface.co/facebook/cotracker3/resolve/main/scaled_offline.pth",
+    "cotracker3/scaled_online.pth": "https://huggingface.co/facebook/cotracker3/resolve/main/scaled_online.pth",
     "vggsfm/vggsfm_v2_0_0.bin": "https://huggingface.co/facebook/VGGSfM/resolve/main/vggsfm_v2_0_0.bin"
 }
 
@@ -789,21 +789,23 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
     import random
     
     try:
-        from cotracker.predictor import CoTrackerPredictor
+        from cotracker.predictor import CoTrackerOnlinePredictor
     except ImportError:
         res_queue.put({"status": "error", "message": "cotracker module not found in environment."})
         return
 
-    print("[TrackingWorker] Initializing CoTracker...", flush=True)
+    print("[TrackingWorker] Initializing CoTracker3 Online...", flush=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     try:
-        cotracker_model = CoTrackerPredictor(checkpoint=model_path).to(device)
+        cotracker_model = CoTrackerOnlinePredictor(checkpoint=model_path).to(device)
     except Exception as e:
         res_queue.put({"status": "error", "message": f"Failed to load CoTracker3 model: {e}"})
         return
-        
-    print("[TrackingWorker] Model loaded.", flush=True)
+    
+    # The online model processes chunks of `step` frames (window_len // 2)
+    step = cotracker_model.step  # typically 8
+    print(f"[TrackingWorker] Model loaded. Streaming window step: {step} frames.", flush=True)
     
     num_frames = len(exr_files)
     
@@ -827,6 +829,7 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
     
     print(f"[TrackingWorker] Native: {native_w}x{native_h} | Proxy: {proxy_w}x{proxy_h} | Scale: {scale_x:.4f}x{scale_y:.4f}", flush=True)
 
+    # 2. Sample Query Points from Exclusion Masks
     max_points = 4096
     sample_interval = 10
     
@@ -866,54 +869,78 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
         return
         
     queries_tensor = torch.tensor(queries, dtype=torch.float32, device=device)
-    queries_tensor = queries_tensor.unsqueeze(0) # (1, N, 3)
+    queries_tensor = queries_tensor.unsqueeze(0)  # (1, N, 3)
     
-    print("[TrackingWorker] Streaming PROXY frames and running inference...", flush=True)
-    step = 8 # CoTracker3 standard online step
-    video_chunk = []
-    is_first_step = True
+    # 3. Streaming Online Inference — window_len frames on GPU at a time, sliding by step
+    window_len = cotracker_model.model.window_len  # 16
+    print(f"[TrackingWorker] Starting streaming inference ({num_frames} frames, window={window_len}, step={step})...", flush=True)
     
-    pred_tracks, pred_visibility = None, None
+    # Number of sliding window positions
+    num_chunks = max(1, math.ceil((num_frames - window_len) / step) + 1)
     
-    for i in range(num_frames):
-        proxy_path = os.path.join(proxies_dir, f"{i:05d}.jpg")
-        proxy_img = cv2.imread(proxy_path)
-        
-        # Convert BGR to RGB
-        proxy_img = cv2.cvtColor(proxy_img, cv2.COLOR_BGR2RGB)
-        
-        # Proxies are already color managed in the UI/Daemon. They are 8-bit sRGB (or ACEScg display mapped).
-        # We just need to format them for CoTracker (float32 [0, 255])
-        rgb = proxy_img.astype(np.float32)
-        rgb_chw = np.transpose(rgb, (2, 0, 1))
-        video_chunk.append(rgb_chw)
-        
-        # When chunk reaches step size, or on the final frame
-        if len(video_chunk) == step or i == num_frames - 1:
-            chunk_tensor = torch.tensor(np.array(video_chunk), device=device).unsqueeze(0)
-            
-            with torch.no_grad():
+    pred_tracks = None
+    pred_visibility = None
+    
+    def read_chunk(start, length):
+        """Read `length` frames from disk starting at `start`, padding if needed."""
+        chunk = torch.empty((1, length, 3, proxy_h, proxy_w), dtype=torch.float32, device='cpu')
+        for j in range(length):
+            f_idx = min(start + j, num_frames - 1)  # clamp to last frame for padding
+            proxy_path = os.path.join(proxies_dir, f"{f_idx:05d}.jpg")
+            proxy_img = cv2.imread(proxy_path)
+            proxy_img = cv2.cvtColor(proxy_img, cv2.COLOR_BGR2RGB)
+            rgb_chw = np.transpose(proxy_img.astype(np.float32), (2, 0, 1))
+            chunk[0, j] = torch.from_numpy(rgb_chw)
+        return chunk.to(device, dtype=torch.float16)
+    
+    with torch.inference_mode():
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            for chunk_idx in range(num_chunks):
+                start_f = chunk_idx * step
+                
+                # Read a full window_len chunk
+                chunk_tensor = read_chunk(start_f, window_len)
+                
+                if chunk_idx == 0:
+                    # First call: initialize online processing and pass queries
+                    cotracker_model(
+                        chunk_tensor, 
+                        is_first_step=True, 
+                        queries=queries_tensor
+                    )
+                
+                # Process the chunk
                 pred_tracks, pred_visibility = cotracker_model(
                     chunk_tensor, 
-                    is_first_step=is_first_step, 
-                    queries=queries_tensor if is_first_step else None
+                    is_first_step=False
                 )
                 
-            is_first_step = False
-            video_chunk = [] # clear chunk for next step
-            
-            res_queue.put({"status": "track_progress", "value": int((i/num_frames)*80)})
-            
+                # Free this chunk immediately
+                del chunk_tensor
+                
+                progress = int(20 + (chunk_idx / num_chunks) * 60)
+                res_queue.put({"status": "track_progress", "value": progress})
+                print(f"[TrackingWorker] Chunk {chunk_idx+1}/{num_chunks} done. VRAM: {torch.cuda.memory_allocated() / (1024**2):.0f} MB", flush=True)
+    
+    if pred_tracks is None:
+        res_queue.put({"status": "error", "message": "CoTracker3 produced no tracks."})
+        return
+    
+    # Trim padded frames if necessary — online predictor accumulates all frames
+    pred_tracks = pred_tracks[:, :num_frames]
+    pred_visibility = pred_visibility[:, :num_frames]
+    
     tracks_np = pred_tracks.squeeze(0).cpu().numpy()
     vis_np = pred_visibility.squeeze(0).cpu().numpy()
     
     res_queue.put({"status": "track_progress", "value": 85})
     
-    # 2. Mathematically Upscale Tracks to Native Space
+    # 4. Mathematically Upscale Tracks to Native Space
     print("[TrackingWorker] Upscaling tracks to native resolution...", flush=True)
     tracks_np[:, :, 0] *= scale_x
     tracks_np[:, :, 1] *= scale_y
     
+    # 5. Collision Filtering Against Native-Resolution Exclusion Masks
     print("[TrackingWorker] Filtering collisions...", flush=True)
     T, N, _ = tracks_np.shape
     valid_mask = np.ones(N, dtype=bool)
@@ -945,6 +972,7 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
     
     print(f"[TrackingWorker] Filtered {N - np.sum(valid_mask)} points. Remaining: {np.sum(valid_mask)}.", flush=True)
     
+    # 6. Save & Cleanup
     out_path = os.path.join(project_dir, 'tracks.npz')
     np.savez(out_path, tracks=filtered_tracks, visibility=filtered_vis)
     print(f"[TrackingWorker] Saved tracks to {out_path}", flush=True)
@@ -953,7 +981,10 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
     
     print("[TrackingWorker] Executing VRAM cleanup...", flush=True)
     del cotracker_model
-    del video_tensor
+    if pred_tracks is not None:
+        del pred_tracks
+    if pred_visibility is not None:
+        del pred_visibility
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1374,6 +1405,8 @@ class MainWindow(QMainWindow):
                 self.masking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
                 if hasattr(self, 'tracking_viewer'):
                     self.tracking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
+                    if hasattr(self, 'btn_run_tracking'):
+                        self.btn_run_tracking.setEnabled(True)
                 um_path = os.path.join(self.project_dir, 'user_masks', "umask_00000.png")
                 if os.path.exists(um_path):
                     self.lbl_user_mask_status.setText("Custom Masks Loaded (from project)")
@@ -1457,6 +1490,8 @@ class MainWindow(QMainWindow):
         self.masking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
         if hasattr(self, 'tracking_viewer'):
             self.tracking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
+            if hasattr(self, 'btn_run_tracking'):
+                self.btn_run_tracking.setEnabled(True)
             
     def on_proxy_error(self, err_str):
         self.btn_import_exr.setEnabled(True)
@@ -1493,9 +1528,9 @@ class MainWindow(QMainWindow):
         import multiprocessing
         
         MODELS_DIR = os.path.join(os.getcwd(), 'models')
-        model_path = os.path.join(MODELS_DIR, "cotracker3", "scaled_offline.pth")
+        model_path = os.path.join(MODELS_DIR, "cotracker3", "scaled_online.pth")
         if not os.path.exists(model_path):
-            QMessageBox.critical(self, "Model Not Found", "CoTracker3 model (scaled_offline.pth) is not found in the model manager.\nPlease go to the Setup tab and download the missing models.")
+            QMessageBox.critical(self, "Model Not Found", "CoTracker3 model (scaled_online.pth) is not found in the model manager.\nPlease go to the Setup tab and download the missing models.")
             self.tabs.setCurrentIndex(0)
             return
             
@@ -1538,13 +1573,16 @@ class MainWindow(QMainWindow):
                         "frame_index": self.masking_viewer.slider.value(),
                         "clicks": self.masking_viewer.click_data
                     })
-        elif index == 2: # Tracking tab
-            self.tracking_viewer.update_sequence(self.exr_files, getattr(self, 'color_space', CS_LINEAR_SRGB), self.project_dir)
-            self.update_ui_state()
+        else:
             if self.daemon_process and self.daemon_process.is_alive():
-                print("Exiting SAM 2 Daemon for Tracking Phase.")
+                print("Exiting SAM 2 Daemon.", flush=True)
                 self.cmd_queue.put({"action": "exit_and_cleanup"})
                 self.daemon_process = None
+
+        if self.tabs.widget(index) == getattr(self, 'tracking_tab', None) or index == 2:
+            self.tracking_viewer.update_sequence(self.exr_files, getattr(self, 'color_space', CS_LINEAR_SRGB), self.project_dir)
+            if self.exr_files and hasattr(self, 'btn_run_tracking'):
+                self.btn_run_tracking.setEnabled(True)
 
     def start_daemon(self):
         self.cmd_queue = multiprocessing.Queue()
@@ -1620,6 +1658,26 @@ class MainWindow(QMainWindow):
                     self.daemon_process = None
                     self.timer.stop()
                     QMessageBox.information(self, "Cleanup Complete", "VRAM Cleared! Ready for CoTracker3.")
+                    
+                elif status == "error":
+                    QMessageBox.critical(self, "Worker Error", res.get("message", "Unknown error."))
+                    if hasattr(self, 'tracking_viewer'):
+                        self.tracking_viewer.set_loading_state(False)
+                    if hasattr(self, 'btn_run_tracking'):
+                        self.btn_run_tracking.setEnabled(True)
+                
+                elif status == "track_progress":
+                    if hasattr(self, 'tracking_viewer'):
+                        self.tracking_viewer.loading_overlay.setText(f"Running CoTracker3 Inference...\nProgress: {res.get('value')}%")
+                    
+                elif status == "track_done":
+                    if hasattr(self, 'tracking_viewer'):
+                        self.tracking_viewer.set_loading_state(False)
+                    if hasattr(self, 'btn_run_tracking'):
+                        self.btn_run_tracking.setEnabled(True)
+                    if hasattr(self, 'tracking_viewer'):
+                        self.tracking_viewer.update_sequence(self.exr_files, getattr(self, 'color_space', CS_LINEAR_SRGB), self.project_dir)
+                    QMessageBox.information(self, "Finished", "Tracking Complete!")
             except queue.Empty:
                 pass
                 
