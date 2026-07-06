@@ -1032,10 +1032,10 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
     
     print("[TrackingWorker] Executing VRAM cleanup...", flush=True)
     del cotracker_model
-    if pred_tracks is not None:
-        del pred_tracks
-    if pred_visibility is not None:
-        del pred_visibility
+    if 'merged_tracks' in locals():
+        del merged_tracks
+    if 'merged_vis' in locals():
+        del merged_vis
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
