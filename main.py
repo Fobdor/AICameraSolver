@@ -269,7 +269,7 @@ class SequenceViewerWidget(QWidget):
         layout.addWidget(self.view)
         
         self.loading_overlay = QLabel(self.view)
-        self.loading_overlay.setText("Initializing SAM 2 & Building Proxies...\nPlease wait.")
+        self.loading_overlay.setText("Initializing SAM 2...\nPlease wait.")
         self.loading_overlay.setStyleSheet("background-color: rgba(0, 0, 0, 180); color: white; font-size: 24px; font-weight: bold;")
         self.loading_overlay.setAlignment(Qt.AlignCenter)
         self.loading_overlay.hide()
@@ -1122,6 +1122,29 @@ class MainWindow(QMainWindow):
         top_layout.addStretch()
         layout.addLayout(top_layout)
         
+        # Second row of controls
+        ctrl_layout = QHBoxLayout()
+        ctrl_layout.addWidget(QLabel("Proxy Resolution:"))
+        self.combo_res = QComboBox()
+        self.combo_res.addItem("1024px (Fast)", 1024)
+        self.combo_res.addItem("1536px (Balanced)", 1536)
+        self.combo_res.addItem("1920px (High Quality)", 1920)
+        self.combo_res.setCurrentIndex(1)
+        ctrl_layout.addWidget(self.combo_res)
+        
+        ctrl_layout.addWidget(QLabel("Color Space:"))
+        self.combo_colorspace = QComboBox()
+        self.combo_colorspace.addItems([CS_LINEAR_SRGB, CS_ACESCG])
+        ctrl_layout.addWidget(self.combo_colorspace)
+        
+        self.btn_regen_proxies = QPushButton("Regenerate Proxies")
+        self.btn_regen_proxies.clicked.connect(self.regenerate_proxies)
+        self.btn_regen_proxies.setEnabled(False)
+        ctrl_layout.addWidget(self.btn_regen_proxies)
+        
+        ctrl_layout.addStretch()
+        layout.addLayout(ctrl_layout)
+        
         self.lbl_file = QLabel("No sequence loaded.")
         layout.addWidget(self.lbl_file)
         
@@ -1311,7 +1334,16 @@ class MainWindow(QMainWindow):
             self.proxy_res = data.get("proxy_res", 1536)
             self.native_sizes = data.get("native_sizes", [])
                 
+            cs_idx = self.combo_colorspace.findText(self.color_space)
+            if cs_idx >= 0:
+                self.combo_colorspace.setCurrentIndex(cs_idx)
+                
+            res_idx = self.combo_res.findData(self.proxy_res)
+            if res_idx >= 0:
+                self.combo_res.setCurrentIndex(res_idx)
+                
             self.btn_import_exr.setEnabled(True)
+            self.btn_regen_proxies.setEnabled(True)
             self.lbl_file.setText(f"Project: {self.project_root} | Frames: {len(self.exr_files)}")
             
             if self.exr_files:
@@ -1375,6 +1407,7 @@ class MainWindow(QMainWindow):
                 self.proxy_res = settings["proxy_resolution"]
                 
                 self.btn_import_exr.setEnabled(False)
+                self.btn_regen_proxies.setEnabled(False)
                 self.lbl_file.setText("Generating Proxies... Please wait.")
                 
                 self.proxy_worker = ProxyGeneratorWorker(self.exr_files, self.project_dir, self.color_space, self.proxy_res)
@@ -1394,6 +1427,7 @@ class MainWindow(QMainWindow):
         self.save_project()
         
         self.btn_import_exr.setEnabled(True)
+        self.btn_regen_proxies.setEnabled(True)
         self.lbl_file.setText(f"Project: {self.project_root} | Frames: {len(self.exr_files)}")
         
         cs = self.color_space
@@ -1404,8 +1438,32 @@ class MainWindow(QMainWindow):
             
     def on_proxy_error(self, err_str):
         self.btn_import_exr.setEnabled(True)
+        if hasattr(self, 'exr_files') and self.exr_files:
+            self.btn_regen_proxies.setEnabled(True)
         self.lbl_file.setText("Proxy generation failed.")
         QMessageBox.critical(self, "Error", f"Failed to generate proxies: {err_str}")
+
+    def regenerate_proxies(self):
+        if not self.exr_files or not self.project_dir:
+            return
+            
+        import shutil
+        proxies_dir = os.path.join(self.project_dir, 'proxies')
+        if os.path.exists(proxies_dir):
+            shutil.rmtree(proxies_dir)
+            
+        self.color_space = self.combo_colorspace.currentText()
+        self.proxy_res = self.combo_res.currentData()
+        
+        self.btn_import_exr.setEnabled(False)
+        self.btn_regen_proxies.setEnabled(False)
+        self.lbl_file.setText("Regenerating Proxies... Please wait.")
+        
+        self.proxy_worker = ProxyGeneratorWorker(self.exr_files, self.project_dir, self.color_space, self.proxy_res)
+        self.proxy_worker.progress.connect(self.on_proxy_progress)
+        self.proxy_worker.finished.connect(self.on_proxy_finished)
+        self.proxy_worker.error.connect(self.on_proxy_error)
+        self.proxy_worker.start()
 
     def run_tracking(self):
         import os
