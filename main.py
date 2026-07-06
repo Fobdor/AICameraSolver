@@ -976,6 +976,7 @@ class MainWindow(QMainWindow):
         cs = self.get_color_space()
         self.setup_viewer.set_color_space(cs)
         self.masking_viewer.set_color_space(cs)
+        self.save_project()
 
     def new_project(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Select Folder to Create Project", "")
