@@ -548,7 +548,7 @@ class SequenceViewerWidget(QWidget):
 
 
 # --- PERSISTENT WORKER DAEMON ---
-def persistent_worker_daemon(cmd_queue, res_queue, exr_files, project_dir, native_sizes):
+def persistent_worker_daemon(cmd_queue, res_queue, exr_files, project_dir, native_sizes, proxy_res):
     print(f"\n[Daemon] Started Masking Daemon.", flush=True)
     masks_dir = os.path.join(project_dir, 'masks')
     proxies_dir = os.path.join(project_dir, 'proxies')
@@ -622,7 +622,7 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, project_dir, nativ
 
     def simulate_frame(frame_idx, clicks):
         native_w, native_h = native_sizes[frame_idx]
-        scale = 1024.0 / max(native_w, native_h) if (native_w > 1024 or native_h > 1024) else 1.0
+        scale = proxy_res / max(native_w, native_h) if (native_w > proxy_res or native_h > proxy_res) else 1.0
         proxy_mask = np.zeros((int(native_h * scale), int(native_w * scale)), dtype=np.uint8)
         frame_clicks = [(cx, cy, ptype) for cx, cy, f_idx, ptype, obj_id in clicks if f_idx == frame_idx]
         for cx, cy, ptype in frame_clicks:
@@ -642,7 +642,7 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, project_dir, nativ
             
             if sam_model is not None and not isinstance(sam_model, torch.Tensor):
                 native_w, native_h = native_sizes[0]
-                scale = 1024.0 / max(native_w, native_h) if (native_w > 1024 or native_h > 1024) else 1.0
+                scale = proxy_res / max(native_w, native_h) if (native_w > proxy_res or native_h > proxy_res) else 1.0
                 
                 sam_model.reset_state(inference_state)
                 unique_frames = set([f for x, y, f, t, o in clicks])
@@ -1472,7 +1472,7 @@ class MainWindow(QMainWindow):
         
         self.daemon_process = multiprocessing.Process(
             target=persistent_worker_daemon, 
-            args=(self.cmd_queue, self.res_queue, self.exr_files, self.project_dir, self.native_sizes)
+            args=(self.cmd_queue, self.res_queue, self.exr_files, self.project_dir, self.native_sizes, self.proxy_res)
         )
         self.daemon_process.start()
         self.timer.start(50)
