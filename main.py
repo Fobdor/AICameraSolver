@@ -11,10 +11,12 @@ import numpy as np
 import OpenImageIO as oiio
 import cv2
 import math
+import shutil
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QProgressBar, QLabel, 
                                QFileDialog, QTabWidget, QMessageBox, QGraphicsView,
-                               QGraphicsScene, QSlider, QComboBox, QGroupBox, QGridLayout, QSpinBox)
+                               QGraphicsScene, QSlider, QComboBox, QGroupBox, QGridLayout, QSpinBox,
+                               QInputDialog)
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen
 from PySide6.QtCore import QTimer, Qt, QPointF, QThread, Signal
 
@@ -812,6 +814,9 @@ class MainWindow(QMainWindow):
         
         self.exr_files = []
         self.project_dir = None
+        self.project_root = None
+        self.project_file = None
+        self.undistorted_source_dir = None
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -834,9 +839,21 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         
         top_layout = QHBoxLayout()
-        btn_load = QPushButton("Load EXR Sequence Folder")
-        btn_load.clicked.connect(self.load_exr)
-        top_layout.addWidget(btn_load)
+        self.btn_new_proj = QPushButton("New Project")
+        self.btn_new_proj.clicked.connect(self.new_project)
+        self.btn_load_proj = QPushButton("Load Project")
+        self.btn_load_proj.clicked.connect(self.load_project)
+        self.btn_save_proj = QPushButton("Save Project")
+        self.btn_save_proj.clicked.connect(self.save_project)
+        
+        self.btn_import_exr = QPushButton("Import EXR Sequence")
+        self.btn_import_exr.clicked.connect(self.import_exr)
+        self.btn_import_exr.setEnabled(False)
+        
+        top_layout.addWidget(self.btn_new_proj)
+        top_layout.addWidget(self.btn_load_proj)
+        top_layout.addWidget(self.btn_save_proj)
+        top_layout.addWidget(self.btn_import_exr)
         
         top_layout.addWidget(QLabel("Color Space:"))
         self.combo_colorspace = QComboBox()
@@ -960,37 +977,127 @@ class MainWindow(QMainWindow):
         self.setup_viewer.set_color_space(cs)
         self.masking_viewer.set_color_space(cs)
 
-    def load_exr(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "Select EXR Sequence Folder", "")
-        if dir_path:
-            try:
-                files = [f for f in os.listdir(dir_path) if f.lower().endswith('.exr')]
-                if not files:
-                    QMessageBox.warning(self, "Warning", "No EXR files found in the selected folder.")
-                    return
-                files.sort()
-                self.exr_files = [os.path.join(dir_path, f) for f in files]
+    def new_project(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Folder to Create Project", "")
+        if not dir_path: return
+        
+        proj_name, ok = QInputDialog.getText(self, "Project Name", "Enter a name for the new project:")
+        if not ok or not proj_name.strip(): return
+        proj_name = proj_name.strip()
+        
+        self.project_root = os.path.join(dir_path, proj_name)
+        if os.path.exists(self.project_root):
+            QMessageBox.warning(self, "Warning", "A folder with this name already exists here.")
+            return
+            
+        os.makedirs(self.project_root, exist_ok=True)
+        self.undistorted_source_dir = os.path.join(self.project_root, "undistorted_source")
+        self.project_dir = os.path.join(self.project_root, "source_AICameraSolver_Data")
+        os.makedirs(self.undistorted_source_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.project_dir, 'masks'), exist_ok=True)
+        os.makedirs(os.path.join(self.project_dir, 'proxies'), exist_ok=True)
+        os.makedirs(os.path.join(self.project_dir, 'exports'), exist_ok=True)
+        os.makedirs(os.path.join(self.project_dir, 'user_masks'), exist_ok=True)
+        
+        self.project_file = os.path.join(self.project_root, "project.json")
+        self.exr_files = []
+        self.save_project()
+        
+        self.btn_import_exr.setEnabled(True)
+        self.lbl_file.setText(f"Project: {self.project_root} | No sequence imported.")
+        QMessageBox.information(self, "Success", "Project created successfully. You can now import an EXR sequence.")
+
+    def save_project(self):
+        if not self.project_file: return
+        data = {
+            "exr_files": self.exr_files,
+            "color_space": self.get_color_space()
+        }
+        with open(self.project_file, 'w') as f:
+            json.dump(data, f, indent=4)
+            
+    def load_project(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Project File", "", "JSON (*.json)")
+        if not file_path: return
+        
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
                 
-                # Setup Project Directory
-                seq_name = os.path.basename(dir_path)
-                self.project_dir = os.path.join(os.path.dirname(dir_path), f"{seq_name}_AICameraSolver_Data")
-                os.makedirs(os.path.join(self.project_dir, 'masks'), exist_ok=True)
-                os.makedirs(os.path.join(self.project_dir, 'proxies'), exist_ok=True)
-                os.makedirs(os.path.join(self.project_dir, 'exports'), exist_ok=True)
+            self.project_file = file_path
+            self.project_root = os.path.dirname(file_path)
+            self.undistorted_source_dir = os.path.join(self.project_root, "undistorted_source")
+            self.project_dir = os.path.join(self.project_root, "source_AICameraSolver_Data")
+            
+            self.exr_files = data.get("exr_files", [])
+            
+            cs = data.get("color_space", CS_LINEAR_SRGB)
+            index = self.combo_colorspace.findText(cs)
+            if index >= 0:
+                self.combo_colorspace.setCurrentIndex(index)
                 
-                self.lbl_file.setText(f"Project: {self.project_dir} | Frames: {len(self.exr_files)}")
-                
-                cs = self.get_color_space()
+            self.btn_import_exr.setEnabled(True)
+            self.lbl_file.setText(f"Project: {self.project_root} | Frames: {len(self.exr_files)}")
+            
+            if self.exr_files:
                 self.setup_viewer.update_sequence(self.exr_files, cs, self.project_dir)
                 self.masking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
-                
                 um_path = os.path.join(self.project_dir, 'user_masks', "umask_00000.png")
                 if os.path.exists(um_path):
                     self.lbl_user_mask_status.setText("Custom Masks Loaded (from project)")
                     self.lbl_user_mask_status.setStyleSheet("color: white;")
                     
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load EXR sequence: {str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load project: {str(e)}")
+
+    def import_exr(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Source EXR Sequence Folder", "")
+        if not dir_path: return
+        
+        try:
+            files = [f for f in os.listdir(dir_path) if f.lower().endswith('.exr')]
+            if not files:
+                QMessageBox.warning(self, "Warning", "No EXR files found in the selected folder.")
+                return
+            files.sort()
+            
+            if os.path.abspath(dir_path) == os.path.abspath(self.undistorted_source_dir):
+                final_files = [os.path.join(dir_path, f) for f in files]
+            else:
+                msgBox = QMessageBox()
+                msgBox.setWindowTitle("Import EXR Sequence")
+                msgBox.setText("Do you want to Copy or Move the source files into the project's 'undistorted_source' folder?")
+                btn_copy = msgBox.addButton("Copy", QMessageBox.ActionRole)
+                btn_move = msgBox.addButton("Move", QMessageBox.ActionRole)
+                btn_cancel = msgBox.addButton("Cancel", QMessageBox.RejectRole)
+                msgBox.exec()
+                
+                if msgBox.clickedButton() == btn_cancel:
+                    return
+                
+                action = "copy" if msgBox.clickedButton() == btn_copy else "move"
+                final_files = []
+                
+                for f in files:
+                    src = os.path.join(dir_path, f)
+                    dst = os.path.join(self.undistorted_source_dir, f)
+                    if action == "copy":
+                        shutil.copy2(src, dst)
+                    else:
+                        shutil.move(src, dst)
+                    final_files.append(dst)
+                    
+            self.exr_files = final_files
+            self.save_project()
+            
+            self.lbl_file.setText(f"Project: {self.project_root} | Frames: {len(self.exr_files)}")
+            
+            cs = self.get_color_space()
+            self.setup_viewer.update_sequence(self.exr_files, cs, self.project_dir)
+            self.masking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to import EXR sequence: {str(e)}")
 
     def on_tab_changed(self, index):
         if self.tabs.widget(index) == self.masking_tab:
@@ -1103,8 +1210,37 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Count Mismatch", f"You selected a folder with {len(files)} mask files, but there are {len(self.exr_files)} EXR frames. They must match.")
             return
             
+        user_masks_source_dir = os.path.join(self.project_root, "user_masks_source")
+        os.makedirs(user_masks_source_dir, exist_ok=True)
+        
+        if os.path.abspath(dir_path) == os.path.abspath(user_masks_source_dir):
+            final_files = [os.path.join(dir_path, f) for f in files]
+        else:
+            msgBox = QMessageBox()
+            msgBox.setWindowTitle("Import User Masks")
+            msgBox.setText("Do you want to Copy or Move the mask files into the project's 'user_masks_source' folder?")
+            btn_copy = msgBox.addButton("Copy", QMessageBox.ActionRole)
+            btn_move = msgBox.addButton("Move", QMessageBox.ActionRole)
+            btn_cancel = msgBox.addButton("Cancel", QMessageBox.RejectRole)
+            msgBox.exec()
+            
+            if msgBox.clickedButton() == btn_cancel:
+                return
+            
+            action = "copy" if msgBox.clickedButton() == btn_copy else "move"
+            final_files = []
+            
+            for f in files:
+                src = os.path.join(dir_path, f)
+                dst = os.path.join(user_masks_source_dir, f)
+                if action == "copy":
+                    shutil.copy2(src, dst)
+                else:
+                    shutil.move(src, dst)
+                final_files.append(dst)
+                
         if self.daemon_process and self.daemon_process.is_alive():
-            self.lbl_user_mask_status.setText(f"Loaded: {os.path.basename(files[0])}...")
+            self.lbl_user_mask_status.setText(f"Loaded: {os.path.basename(final_files[0])}...")
             self.lbl_user_mask_status.setStyleSheet("color: white;")
             self.btn_load_user_mask.setEnabled(False)
             self.btn_gen_mask.setEnabled(False)
@@ -1112,7 +1248,7 @@ class MainWindow(QMainWindow):
             self.masking_viewer.set_loading_state(True)
             self.cmd_queue.put({
                 "action": "ingest_custom_masks",
-                "mask_files": files,
+                "mask_files": final_files,
                 "clicks": self.masking_viewer.click_data
             })
 
