@@ -639,7 +639,9 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, proje
         frame_path = exr_files[frame_idx]
         base_name = os.path.splitext(os.path.basename(frame_path))[0]
         out_mask = os.path.join(masks_dir, f"{base_name}_mask.png")
-        cv2.imwrite(out_mask, master_mask)
+        # Ensure any masked pixel (SAM objects 1, 2, 3 or alphas) is saved as 255 (White)
+        final_png = (master_mask > 0).astype(np.uint8) * 255
+        cv2.imwrite(out_mask, final_png)
 
     def simulate_frame(frame_idx, clicks):
         native_w, native_h = native_sizes[frame_idx]
