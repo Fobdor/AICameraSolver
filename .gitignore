@@ -43,3 +43,7 @@ Thumbs.db
 models/
 weights/
 checkpoints/
+
+# Temporary test artifacts
+temp_masks/
+test_daemon.py
