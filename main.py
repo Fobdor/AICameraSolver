@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QProgressBar, QLabel, 
                                QFileDialog, QTabWidget, QMessageBox, QGraphicsView,
                                QGraphicsScene, QSlider, QComboBox, QGroupBox, QGridLayout, QSpinBox,
-                               QInputDialog)
+                               QInputDialog, QDialog)
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen
 from PySide6.QtCore import QTimer, Qt, QPointF, QThread, Signal
 
@@ -253,6 +253,9 @@ class SequenceViewerWidget(QWidget):
         # [(x, y, frame_idx, type, obj_id), ...] where type: 1=pos, 0=neg
         self.click_data = []
         
+        self.track_data = None
+        self.track_vis = None
+        
         layout = QVBoxLayout(self)
         
         self.scene = QGraphicsScene()
@@ -430,6 +433,12 @@ class SequenceViewerWidget(QWidget):
         if self.exr_files:
             self.on_frame_changed(self.slider.value())
 
+    def set_track_data(self, tracks, vis):
+        self.track_data = tracks
+        self.track_vis = vis
+        if self.exr_files:
+            self.on_frame_changed(self.slider.value())
+
     def set_overlay_mode(self, enabled):
         self.show_overlay = enabled
         if self.exr_files:
@@ -450,7 +459,7 @@ class SequenceViewerWidget(QWidget):
                 mask_mtime = os.path.getmtime(mask_path)
             
         base_pixmap = QPixmap()
-        if self.interactive and self.project_dir:
+        if self.project_dir:
             proxy_path = os.path.join(self.project_dir, 'proxies', f"{index:05d}.jpg")
             if os.path.exists(proxy_path):
                 base_pixmap = fetch_proxy_qpixmap(proxy_path, mask_path, mask_mtime)
@@ -492,6 +501,32 @@ class SequenceViewerWidget(QWidget):
                     painter.drawEllipse(QPointF(draw_x, draw_y), 6, 6)
             painter.end()
             final_pixmap = display_pixmap
+        elif self.track_data is not None and self.track_vis is not None:
+            display_pixmap = QPixmap(base_pixmap)
+            painter = QPainter(display_pixmap)
+            
+            scale_x, scale_y = 1.0, 1.0
+            if self.native_size != (0,0):
+                native_w, native_h = self.native_size
+                proxy_w = display_pixmap.width()
+                if proxy_w > 0 and proxy_w != native_w:
+                    scale_x = proxy_w / native_w
+                    scale_y = display_pixmap.height() / native_h
+
+            color = QColor(0, 255, 0, 200)
+            painter.setPen(QPen(color, 2))
+            painter.setBrush(color)
+            
+            if index < self.track_data.shape[0]:
+                points = self.track_data[index]
+                vis = self.track_vis[index]
+                for i in range(points.shape[0]):
+                    if vis[i]:
+                        draw_x = int(points[i, 0] * scale_x)
+                        draw_y = int(points[i, 1] * scale_y)
+                        painter.drawEllipse(QPointF(draw_x, draw_y), 3, 3)
+            painter.end()
+            final_pixmap = display_pixmap
         else:
             final_pixmap = base_pixmap
         
@@ -513,12 +548,16 @@ class SequenceViewerWidget(QWidget):
 
 
 # --- PERSISTENT WORKER DAEMON ---
-def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, project_dir):
+def persistent_worker_daemon(cmd_queue, res_queue, exr_files, project_dir, native_sizes):
     print(f"\n[Daemon] Started Masking Daemon.", flush=True)
     masks_dir = os.path.join(project_dir, 'masks')
     proxies_dir = os.path.join(project_dir, 'proxies')
+    alphas_dir = os.path.join(project_dir, 'alphas')
+    user_masks_dir = os.path.join(project_dir, 'user_masks')
     os.makedirs(masks_dir, exist_ok=True)
     os.makedirs(proxies_dir, exist_ok=True)
+    os.makedirs(alphas_dir, exist_ok=True)
+    os.makedirs(user_masks_dir, exist_ok=True)
     
     try:
         import torch
@@ -548,68 +587,6 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, proje
             sam_model = torch.randn((1, 256, 1024, 1024), device=device)
         print(f"[Daemon] VRAM after allocation: {torch.cuda.memory_allocated() / (1024**2):.2f} MB", flush=True)
 
-    print("[Daemon] Validating proxies and extracting metadata (Multithreaded)...", flush=True)
-    import concurrent.futures
-    alphas_dir = os.path.join(project_dir, 'alphas')
-    os.makedirs(alphas_dir, exist_ok=True)
-    
-    native_sizes = [None] * len(exr_files)
-    
-    def process_frame(i, frame_path):
-        proxy_path = os.path.join(proxies_dir, f"{i:05d}.jpg")
-        alpha_path = os.path.join(alphas_dir, f"alpha_{i:05d}.png")
-        
-        inp = oiio.ImageInput.open(frame_path)
-        spec = inp.spec()
-        native_w, native_h = spec.width, spec.height
-        has_alpha = spec.nchannels >= 4
-        
-        needs_proxy = not os.path.exists(proxy_path)
-        needs_alpha = has_alpha and not os.path.exists(alpha_path)
-        
-        if needs_proxy or needs_alpha:
-            image_data = inp.read_image()
-            if needs_proxy:
-                rgb_array = image_data[:, :, :3] if image_data.shape[2] >= 3 else np.stack((image_data,)*3, axis=-1)
-                srgb_array = apply_color_space(rgb_array, color_space)
-                rgb_uint8 = np.clip(srgb_array * 255.0, 0, 255).astype(np.uint8)
-                scale = 1024.0 / max(native_w, native_h) if (native_w > 1024 or native_h > 1024) else 1.0
-                if scale != 1.0:
-                    proxy_w, proxy_h = int(native_w * scale), int(native_h * scale)
-                    proxy_img = cv2.resize(rgb_uint8, (proxy_w, proxy_h), interpolation=cv2.INTER_AREA)
-                else:
-                    proxy_img = rgb_uint8
-                cv2.imwrite(proxy_path, cv2.cvtColor(proxy_img, cv2.COLOR_RGB2BGR))
-                
-            if needs_alpha:
-                alpha_uint8 = np.clip(image_data[:, :, 3] * 255.0, 0, 255).astype(np.uint8)
-                # Invert alpha: user specifies black is masked out. We need White=Excluded for SAM 2 logic.
-                alpha_uint8 = 255 - alpha_uint8
-                cv2.imwrite(alpha_path, alpha_uint8)
-                
-        if has_alpha:
-            base_name = os.path.splitext(os.path.basename(frame_path))[0]
-            mask_path_out = os.path.join(masks_dir, f"{base_name}_mask.png")
-            if not os.path.exists(mask_path_out) and os.path.exists(alpha_path):
-                import shutil
-                shutil.copy(alpha_path, mask_path_out)
-                
-        inp.close()
-        return i, (native_w, native_h)
-
-    user_masks_dir = os.path.join(project_dir, 'user_masks')
-    os.makedirs(user_masks_dir, exist_ok=True)
-
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = {executor.submit(process_frame, i, path): i for i, path in enumerate(exr_files)}
-        completed = 0
-        for future in concurrent.futures.as_completed(futures):
-            i, size = future.result()
-            native_sizes[i] = size
-            completed += 1
-            progress = int((completed / len(exr_files)) * 100)
-            res_queue.put({"status": "init_progress", "value": progress})
-        
     res_queue.put({"status": "init_progress", "value": 100})
     if sam_model is not None and not isinstance(sam_model, torch.Tensor):
         print("[Daemon] Initializing SAM 2 Inference State...", flush=True)
@@ -800,7 +777,284 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, color_space, proje
             break
 
 
+
+def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_queue):
+    import torch
+    import gc
+    import numpy as np
+    import cv2
+    import os
+    import OpenImageIO as oiio
+    import math
+    import random
+    
+    try:
+        from cotracker.predictor import CoTrackerPredictor
+    except ImportError:
+        res_queue.put({"status": "error", "message": "cotracker module not found in environment."})
+        return
+
+    print("[TrackingWorker] Initializing CoTracker...", flush=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    try:
+        cotracker_model = CoTrackerPredictor(checkpoint=model_path).to(device)
+    except Exception as e:
+        res_queue.put({"status": "error", "message": f"Failed to load CoTracker3 model: {e}"})
+        return
+        
+    print("[TrackingWorker] Model loaded.", flush=True)
+    
+    num_frames = len(exr_files)
+    max_points = 4096
+    sample_interval = 10
+    
+    sample_frames = list(range(0, num_frames, sample_interval))
+    if not sample_frames:
+        sample_frames = [0]
+        
+    points_per_frame = max(1, max_points // len(sample_frames))
+    
+    queries = []
+    masks_dir = os.path.join(project_dir, 'masks')
+    
+    print(f"[TrackingWorker] Sampling {points_per_frame} points per frame for {len(sample_frames)} frames...", flush=True)
+    
+    for t in sample_frames:
+        mask_path = os.path.join(masks_dir, f"{os.path.splitext(os.path.basename(exr_files[t]))[0]}_mask.png")
+        if os.path.exists(mask_path):
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        else:
+            mask = None
+            
+        if mask is not None:
+            valid_y, valid_x = np.where(mask == 0)
+        else:
+            inp = oiio.ImageInput.open(exr_files[0])
+            h, w = inp.spec().height, inp.spec().width
+            inp.close()
+            valid_y, valid_x = np.mgrid[0:h, 0:w]
+            valid_y, valid_x = valid_y.flatten(), valid_x.flatten()
+            
+        if len(valid_x) > 0:
+            num_samples = min(points_per_frame, len(valid_x))
+            indices = np.random.choice(len(valid_x), num_samples, replace=False)
+            for idx in indices:
+                queries.append([t, valid_x[idx], valid_y[idx]])
+                
+    if not queries:
+        res_queue.put({"status": "error", "message": "No valid trackable points found across the sequence."})
+        return
+        
+    queries_tensor = torch.tensor(queries, dtype=torch.float32, device=device)
+    queries_tensor = queries_tensor.unsqueeze(0) # (1, N, 3)
+    
+    print("[TrackingWorker] Streaming frames and running inference...", flush=True)
+    step = 8 # CoTracker3 standard online step
+    video_chunk = []
+    is_first_step = True
+    
+    pred_tracks, pred_visibility = None, None
+    
+    for i, exr_file in enumerate(exr_files):
+        inp = oiio.ImageInput.open(exr_file)
+        rgb = inp.read_image(0, 3, oiio.TypeFloat)
+        inp.close()
+        
+        if color_space == 'Linear/sRGB (Display)':
+            rgb = np.clip(rgb, 0.0, 1.0)
+            mask_srgb = rgb <= 0.0031308
+            rgb[mask_srgb] *= 12.92
+            rgb[~mask_srgb] = 1.055 * (rgb[~mask_srgb] ** (1/2.4)) - 0.055
+        
+        rgb = np.clip(rgb * 255.0, 0, 255).astype(np.float32)
+        rgb_chw = np.transpose(rgb, (2, 0, 1))
+        video_chunk.append(rgb_chw)
+        
+        # When chunk reaches step size, or on the final frame
+        if len(video_chunk) == step or i == num_frames - 1:
+            chunk_tensor = torch.tensor(np.array(video_chunk), device=device).unsqueeze(0)
+            
+            with torch.no_grad():
+                pred_tracks, pred_visibility = cotracker_model(
+                    chunk_tensor, 
+                    is_first_step=is_first_step, 
+                    queries=queries_tensor if is_first_step else None
+                )
+                
+            is_first_step = False
+            video_chunk = [] # clear chunk for next step
+            
+            res_queue.put({"status": "track_progress", "value": int((i/num_frames)*80)})
+            
+    tracks_np = pred_tracks.squeeze(0).cpu().numpy()
+    vis_np = pred_visibility.squeeze(0).cpu().numpy()
+    
+    res_queue.put({"status": "track_progress", "value": 85})
+    
+    print("[TrackingWorker] Filtering collisions...", flush=True)
+    T, N, _ = tracks_np.shape
+    valid_mask = np.ones(N, dtype=bool)
+    
+    masks_cache = {}
+    
+    for t in range(T):
+        mask_path = os.path.join(masks_dir, f"{os.path.splitext(os.path.basename(exr_files[t]))[0]}_mask.png")
+        if os.path.exists(mask_path):
+            if t not in masks_cache:
+                masks_cache[t] = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            mask_img = masks_cache[t]
+            
+            for i in range(N):
+                if not valid_mask[i]:
+                    continue
+                if vis_np[t, i]:
+                    x, y = tracks_np[t, i]
+                    x_idx, y_idx = int(round(x)), int(round(y))
+                    
+                    if 0 <= y_idx < mask_img.shape[0] and 0 <= x_idx < mask_img.shape[1]:
+                        if mask_img[y_idx, x_idx] > 0:
+                            valid_mask[i] = False
+                    else:
+                        valid_mask[i] = False
+                        
+    filtered_tracks = tracks_np[:, valid_mask, :]
+    filtered_vis = vis_np[:, valid_mask]
+    
+    print(f"[TrackingWorker] Filtered {N - np.sum(valid_mask)} points. Remaining: {np.sum(valid_mask)}.", flush=True)
+    
+    out_path = os.path.join(project_dir, 'tracks.npz')
+    np.savez(out_path, tracks=filtered_tracks, visibility=filtered_vis)
+    print(f"[TrackingWorker] Saved tracks to {out_path}", flush=True)
+    
+    res_queue.put({"status": "track_progress", "value": 100})
+    
+    print("[TrackingWorker] Executing VRAM cleanup...", flush=True)
+    del cotracker_model
+    del video_tensor
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"[TrackingWorker] VRAM after cleanup: {torch.cuda.memory_allocated() / (1024**2):.2f} MB", flush=True)
+        
+    res_queue.put({"status": "track_done"})
+
+class ProxyGeneratorWorker(QThread):
+    progress = Signal(int)
+    finished = Signal(list) # Returns native sizes
+    error = Signal(str)
+    
+    def __init__(self, exr_files, project_dir, color_space, proxy_res):
+        super().__init__()
+        self.exr_files = exr_files
+        self.project_dir = project_dir
+        self.color_space = color_space
+        self.proxy_res = proxy_res # E.g., 1024, 1536, 1920
+        
+    def run(self):
+        import concurrent.futures
+        try:
+            proxies_dir = os.path.join(self.project_dir, 'proxies')
+            alphas_dir = os.path.join(self.project_dir, 'alphas')
+            masks_dir = os.path.join(self.project_dir, 'masks')
+            os.makedirs(proxies_dir, exist_ok=True)
+            os.makedirs(alphas_dir, exist_ok=True)
+            os.makedirs(masks_dir, exist_ok=True)
+            
+            native_sizes = [None] * len(self.exr_files)
+            
+            def process_frame(i, frame_path):
+                proxy_path = os.path.join(proxies_dir, f"{i:05d}.jpg")
+                alpha_path = os.path.join(alphas_dir, f"alpha_{i:05d}.png")
+                
+                inp = oiio.ImageInput.open(frame_path)
+                spec = inp.spec()
+                native_w, native_h = spec.width, spec.height
+                has_alpha = spec.nchannels >= 4
+                
+                needs_proxy = not os.path.exists(proxy_path)
+                needs_alpha = has_alpha and not os.path.exists(alpha_path)
+                
+                if needs_proxy or needs_alpha:
+                    image_data = inp.read_image()
+                    if needs_proxy:
+                        rgb_array = image_data[:, :, :3] if image_data.shape[2] >= 3 else np.stack((image_data,)*3, axis=-1)
+                        srgb_array = apply_color_space(rgb_array, self.color_space)
+                        rgb_uint8 = np.clip(srgb_array * 255.0, 0, 255).astype(np.uint8)
+                        scale = self.proxy_res / max(native_w, native_h) if (native_w > self.proxy_res or native_h > self.proxy_res) else 1.0
+                        if scale != 1.0:
+                            proxy_w, proxy_h = int(native_w * scale), int(native_h * scale)
+                            proxy_img = cv2.resize(rgb_uint8, (proxy_w, proxy_h), interpolation=cv2.INTER_AREA)
+                        else:
+                            proxy_img = rgb_uint8
+                        cv2.imwrite(proxy_path, cv2.cvtColor(proxy_img, cv2.COLOR_RGB2BGR))
+                        
+                    if needs_alpha:
+                        alpha_uint8 = np.clip(image_data[:, :, 3] * 255.0, 0, 255).astype(np.uint8)
+                        # Invert alpha: user specifies black is masked out. We need White=Excluded for SAM 2 logic.
+                        alpha_uint8 = 255 - alpha_uint8
+                        cv2.imwrite(alpha_path, alpha_uint8)
+                        
+                if has_alpha:
+                    base_name = os.path.splitext(os.path.basename(frame_path))[0]
+                    mask_path_out = os.path.join(masks_dir, f"{base_name}_mask.png")
+                    if not os.path.exists(mask_path_out) and os.path.exists(alpha_path):
+                        import shutil
+                        shutil.copy(alpha_path, mask_path_out)
+                        
+                inp.close()
+                return i, (native_w, native_h)
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = {executor.submit(process_frame, i, path): i for i, path in enumerate(self.exr_files)}
+                completed = 0
+                for future in concurrent.futures.as_completed(futures):
+                    i, size = future.result()
+                    native_sizes[i] = size
+                    completed += 1
+                    prog = int((completed / len(self.exr_files)) * 100)
+                    self.progress.emit(prog)
+            
+            self.finished.emit(native_sizes)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class ImportDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Sequence Settings")
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Select Proxy Resolution:"))
+        self.combo_res = QComboBox()
+        self.combo_res.addItem("1024px (Fast)", 1024)
+        self.combo_res.addItem("1536px (Balanced)", 1536)
+        self.combo_res.addItem("1920px (High Quality)", 1920)
+        self.combo_res.setCurrentIndex(1)
+        layout.addWidget(self.combo_res)
+        
+        layout.addWidget(QLabel("Select Source Color Space:"))
+        self.combo_cs = QComboBox()
+        self.combo_cs.addItems([CS_LINEAR_SRGB, CS_ACESCG])
+        layout.addWidget(self.combo_cs)
+        
+        btn_layout = QHBoxLayout()
+        btn_ok = QPushButton("Import")
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_ok)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+
+    def get_settings(self):
+        return {
+            "proxy_resolution": self.combo_res.currentData(),
+            "color_space": self.combo_cs.currentText()
+        }
+
 # --- MAIN UI ---
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -819,6 +1073,10 @@ class MainWindow(QMainWindow):
         self.project_root = None
         self.project_file = None
         self.undistorted_source_dir = None
+        
+        self.color_space = CS_LINEAR_SRGB
+        self.proxy_res = 1536
+        self.native_sizes = []
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -830,6 +1088,10 @@ class MainWindow(QMainWindow):
         self.masking_tab = QWidget()
         self.tabs.addTab(self.masking_tab, "Masking")
         self.init_masking_tab()
+        
+        self.tracking_tab = QWidget()
+        self.tabs.addTab(self.tracking_tab, "Tracking")
+        self.init_tracking_tab()
         
         self.solve_tab = QWidget()
         self.tabs.addTab(self.solve_tab, "Solve")
@@ -857,11 +1119,6 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.btn_save_proj)
         top_layout.addWidget(self.btn_import_exr)
         
-        top_layout.addWidget(QLabel("Color Space:"))
-        self.combo_colorspace = QComboBox()
-        self.combo_colorspace.addItems([CS_LINEAR_SRGB, CS_ACESCG])
-        self.combo_colorspace.currentIndexChanged.connect(self.on_color_space_changed)
-        top_layout.addWidget(self.combo_colorspace)
         top_layout.addStretch()
         layout.addLayout(top_layout)
         
@@ -963,6 +1220,22 @@ class MainWindow(QMainWindow):
         
         self.masking_tab.setLayout(layout)
 
+    def init_tracking_tab(self):
+        layout = QVBoxLayout()
+        
+        top_layout = QHBoxLayout()
+        self.btn_run_tracking = QPushButton("Run CoTracker3")
+        self.btn_run_tracking.clicked.connect(self.run_tracking)
+        self.btn_run_tracking.setEnabled(False)
+        top_layout.addWidget(self.btn_run_tracking)
+        top_layout.addStretch()
+        layout.addLayout(top_layout)
+        
+        self.tracking_viewer = SequenceViewerWidget(interactive=False)
+        layout.addWidget(self.tracking_viewer, stretch=1)
+        
+        self.tracking_tab.setLayout(layout)
+
     def init_solve_tab(self):
         layout = QVBoxLayout()
         self.btn_start_solve = QPushButton("Start 3D Solver (Cleanup VRAM)")
@@ -971,13 +1244,12 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         self.solve_tab.setLayout(layout)
 
-    def get_color_space(self):
-        return self.combo_colorspace.currentText()
-
     def on_color_space_changed(self):
-        cs = self.get_color_space()
+        cs = self.color_space
         self.setup_viewer.set_color_space(cs)
         self.masking_viewer.set_color_space(cs)
+        if hasattr(self, 'tracking_viewer'):
+            self.tracking_viewer.set_color_space(cs)
         self.save_project()
 
     def new_project(self):
@@ -1014,7 +1286,9 @@ class MainWindow(QMainWindow):
         if not self.project_file: return
         data = {
             "exr_files": self.exr_files,
-            "color_space": self.get_color_space()
+            "color_space": getattr(self, 'color_space', CS_LINEAR_SRGB),
+            "proxy_res": getattr(self, 'proxy_res', 1536),
+            "native_sizes": getattr(self, 'native_sizes', [])
         }
         with open(self.project_file, 'w') as f:
             json.dump(data, f, indent=4)
@@ -1033,18 +1307,19 @@ class MainWindow(QMainWindow):
             self.project_dir = os.path.join(self.project_root, "source_AICameraSolver_Data")
             
             self.exr_files = data.get("exr_files", [])
-            
-            cs = data.get("color_space", CS_LINEAR_SRGB)
-            index = self.combo_colorspace.findText(cs)
-            if index >= 0:
-                self.combo_colorspace.setCurrentIndex(index)
+            self.color_space = data.get("color_space", CS_LINEAR_SRGB)
+            self.proxy_res = data.get("proxy_res", 1536)
+            self.native_sizes = data.get("native_sizes", [])
                 
             self.btn_import_exr.setEnabled(True)
             self.lbl_file.setText(f"Project: {self.project_root} | Frames: {len(self.exr_files)}")
             
             if self.exr_files:
+                cs = self.color_space
                 self.setup_viewer.update_sequence(self.exr_files, cs, self.project_dir)
                 self.masking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
+                if hasattr(self, 'tracking_viewer'):
+                    self.tracking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
                 um_path = os.path.join(self.project_dir, 'user_masks', "umask_00000.png")
                 if os.path.exists(um_path):
                     self.lbl_user_mask_status.setText("Custom Masks Loaded (from project)")
@@ -1091,16 +1366,80 @@ class MainWindow(QMainWindow):
                     final_files.append(dst)
                     
             self.exr_files = final_files
-            self.save_project()
             
-            self.lbl_file.setText(f"Project: {self.project_root} | Frames: {len(self.exr_files)}")
-            
-            cs = self.get_color_space()
-            self.setup_viewer.update_sequence(self.exr_files, cs, self.project_dir)
-            self.masking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
+            # Show Dialog
+            dialog = ImportDialog(self)
+            if dialog.exec() == QDialog.Accepted:
+                settings = dialog.get_settings()
+                self.color_space = settings["color_space"]
+                self.proxy_res = settings["proxy_resolution"]
+                
+                self.btn_import_exr.setEnabled(False)
+                self.lbl_file.setText("Generating Proxies... Please wait.")
+                
+                self.proxy_worker = ProxyGeneratorWorker(self.exr_files, self.project_dir, self.color_space, self.proxy_res)
+                self.proxy_worker.progress.connect(self.on_proxy_progress)
+                self.proxy_worker.finished.connect(self.on_proxy_finished)
+                self.proxy_worker.error.connect(self.on_proxy_error)
+                self.proxy_worker.start()
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to import EXR sequence: {str(e)}")
+
+    def on_proxy_progress(self, val):
+        self.lbl_file.setText(f"Generating Proxies... {val}%")
+
+    def on_proxy_finished(self, native_sizes):
+        self.native_sizes = native_sizes
+        self.save_project()
+        
+        self.btn_import_exr.setEnabled(True)
+        self.lbl_file.setText(f"Project: {self.project_root} | Frames: {len(self.exr_files)}")
+        
+        cs = self.color_space
+        self.setup_viewer.update_sequence(self.exr_files, cs, self.project_dir)
+        self.masking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
+        if hasattr(self, 'tracking_viewer'):
+            self.tracking_viewer.update_sequence(self.exr_files, cs, self.project_dir)
+            
+    def on_proxy_error(self, err_str):
+        self.btn_import_exr.setEnabled(True)
+        self.lbl_file.setText("Proxy generation failed.")
+        QMessageBox.critical(self, "Error", f"Failed to generate proxies: {err_str}")
+
+    def run_tracking(self):
+        import os
+        from PySide6.QtWidgets import QMessageBox
+        import multiprocessing
+        
+        MODELS_DIR = os.path.join(os.getcwd(), 'models')
+        model_path = os.path.join(MODELS_DIR, "cotracker3", "scaled_offline.pth")
+        if not os.path.exists(model_path):
+            QMessageBox.critical(self, "Model Not Found", "CoTracker3 model (scaled_offline.pth) is not found in the model manager.\nPlease go to the Setup tab and download the missing models.")
+            self.tabs.setCurrentIndex(0)
+            return
+            
+        if not self.exr_files or not self.project_dir:
+            return
+            
+        self.tracking_viewer.set_loading_state(True)
+        self.tracking_viewer.loading_overlay.setText("Running CoTracker3 Inference...\nPlease wait.")
+        self.btn_run_tracking.setEnabled(False)
+        
+        if self.daemon_process and self.daemon_process.is_alive():
+            self.cmd_queue.put({"action": "exit_and_cleanup"})
+            self.daemon_process.join(timeout=10)
+            
+        self.cmd_queue = multiprocessing.Queue()
+        self.res_queue = multiprocessing.Queue()
+        cs = getattr(self, 'color_space', CS_LINEAR_SRGB)
+        
+        self.daemon_process = multiprocessing.Process(
+            target=run_tracking_worker, 
+            args=(self.project_dir, self.exr_files, cs, model_path, self.res_queue)
+        )
+        self.daemon_process.start()
+        self.timer.start(50)
 
     def on_tab_changed(self, index):
         if self.tabs.widget(index) == self.masking_tab:
@@ -1119,15 +1458,21 @@ class MainWindow(QMainWindow):
                         "frame_index": self.masking_viewer.slider.value(),
                         "clicks": self.masking_viewer.click_data
                     })
+        elif index == 2: # Tracking tab
+            self.tracking_viewer.update_sequence(self.exr_files, getattr(self, 'color_space', CS_LINEAR_SRGB), self.project_dir)
+            self.update_ui_state()
+            if self.daemon_process and self.daemon_process.is_alive():
+                print("Exiting SAM 2 Daemon for Tracking Phase.")
+                self.cmd_queue.put({"action": "exit_and_cleanup"})
+                self.daemon_process = None
 
     def start_daemon(self):
         self.cmd_queue = multiprocessing.Queue()
         self.res_queue = multiprocessing.Queue()
-        cs = self.get_color_space()
         
         self.daemon_process = multiprocessing.Process(
             target=persistent_worker_daemon, 
-            args=(self.cmd_queue, self.res_queue, self.exr_files, cs, self.project_dir)
+            args=(self.cmd_queue, self.res_queue, self.exr_files, self.project_dir, self.native_sizes)
         )
         self.daemon_process.start()
         self.timer.start(50)
