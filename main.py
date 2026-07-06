@@ -806,6 +806,27 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
     print("[TrackingWorker] Model loaded.", flush=True)
     
     num_frames = len(exr_files)
+    
+    # 1. Determine Native & Proxy Scales
+    proxies_dir = os.path.join(project_dir, 'proxies')
+    first_proxy_path = os.path.join(proxies_dir, "00000.jpg")
+    
+    if not os.path.exists(first_proxy_path):
+        res_queue.put({"status": "error", "message": "Proxy JPEGs not found. Please regenerate proxies."})
+        return
+        
+    proxy_img0 = cv2.imread(first_proxy_path)
+    proxy_h, proxy_w = proxy_img0.shape[:2]
+    
+    inp = oiio.ImageInput.open(exr_files[0])
+    native_w, native_h = inp.spec().width, inp.spec().height
+    inp.close()
+    
+    scale_x = native_w / proxy_w
+    scale_y = native_h / proxy_h
+    
+    print(f"[TrackingWorker] Native: {native_w}x{native_h} | Proxy: {proxy_w}x{proxy_h} | Scale: {scale_x:.4f}x{scale_y:.4f}", flush=True)
+
     max_points = 4096
     sample_interval = 10
     
@@ -830,17 +851,15 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
         if mask is not None:
             valid_y, valid_x = np.where(mask == 0)
         else:
-            inp = oiio.ImageInput.open(exr_files[0])
-            h, w = inp.spec().height, inp.spec().width
-            inp.close()
-            valid_y, valid_x = np.mgrid[0:h, 0:w]
+            valid_y, valid_x = np.mgrid[0:native_h, 0:native_w]
             valid_y, valid_x = valid_y.flatten(), valid_x.flatten()
             
         if len(valid_x) > 0:
             num_samples = min(points_per_frame, len(valid_x))
             indices = np.random.choice(len(valid_x), num_samples, replace=False)
             for idx in indices:
-                queries.append([t, valid_x[idx], valid_y[idx]])
+                # Downscale coordinates to proxy space for CoTracker
+                queries.append([t, valid_x[idx] / scale_x, valid_y[idx] / scale_y])
                 
     if not queries:
         res_queue.put({"status": "error", "message": "No valid trackable points found across the sequence."})
@@ -849,25 +868,23 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
     queries_tensor = torch.tensor(queries, dtype=torch.float32, device=device)
     queries_tensor = queries_tensor.unsqueeze(0) # (1, N, 3)
     
-    print("[TrackingWorker] Streaming frames and running inference...", flush=True)
+    print("[TrackingWorker] Streaming PROXY frames and running inference...", flush=True)
     step = 8 # CoTracker3 standard online step
     video_chunk = []
     is_first_step = True
     
     pred_tracks, pred_visibility = None, None
     
-    for i, exr_file in enumerate(exr_files):
-        inp = oiio.ImageInput.open(exr_file)
-        rgb = inp.read_image(0, 3, oiio.TypeFloat)
-        inp.close()
+    for i in range(num_frames):
+        proxy_path = os.path.join(proxies_dir, f"{i:05d}.jpg")
+        proxy_img = cv2.imread(proxy_path)
         
-        if color_space == 'Linear/sRGB (Display)':
-            rgb = np.clip(rgb, 0.0, 1.0)
-            mask_srgb = rgb <= 0.0031308
-            rgb[mask_srgb] *= 12.92
-            rgb[~mask_srgb] = 1.055 * (rgb[~mask_srgb] ** (1/2.4)) - 0.055
+        # Convert BGR to RGB
+        proxy_img = cv2.cvtColor(proxy_img, cv2.COLOR_BGR2RGB)
         
-        rgb = np.clip(rgb * 255.0, 0, 255).astype(np.float32)
+        # Proxies are already color managed in the UI/Daemon. They are 8-bit sRGB (or ACEScg display mapped).
+        # We just need to format them for CoTracker (float32 [0, 255])
+        rgb = proxy_img.astype(np.float32)
         rgb_chw = np.transpose(rgb, (2, 0, 1))
         video_chunk.append(rgb_chw)
         
@@ -891,6 +908,11 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
     vis_np = pred_visibility.squeeze(0).cpu().numpy()
     
     res_queue.put({"status": "track_progress", "value": 85})
+    
+    # 2. Mathematically Upscale Tracks to Native Space
+    print("[TrackingWorker] Upscaling tracks to native resolution...", flush=True)
+    tracks_np[:, :, 0] *= scale_x
+    tracks_np[:, :, 1] *= scale_y
     
     print("[TrackingWorker] Filtering collisions...", flush=True)
     T, N, _ = tracks_np.shape
