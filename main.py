@@ -241,12 +241,13 @@ class SequenceViewerWidget(QWidget):
     # Signals to communicate with MainWindow
     clicksUpdated = Signal(int) # emits frame_idx
 
-    def __init__(self, parent=None, interactive=False):
+    def __init__(self, parent=None, interactive=False, show_tracks=False):
         super().__init__(parent)
         self.exr_files = []
         self.color_space = CS_LINEAR_SRGB
         self.project_dir = None
         self.interactive = interactive
+        self.show_tracks = show_tracks
         self.show_overlay = False
         self.native_size = (0, 0)
         
@@ -413,6 +414,18 @@ class SequenceViewerWidget(QWidget):
                     self.click_data = []
             else:
                 self.click_data = []
+            
+            # Auto-load track data from tracks.npz — only for the tracking viewer
+            if self.show_tracks:
+                tracks_path = os.path.join(self.project_dir, 'tracks.npz')
+                if os.path.exists(tracks_path):
+                    try:
+                        data = np.load(tracks_path)
+                        self.track_data = data['tracks']   # (T, N, 2) in native coords
+                        self.track_vis  = data['visibility']  # (T, N)
+                        print(f"[Viewer] Loaded {self.track_data.shape[1]} tracks from {tracks_path}")
+                    except Exception as e:
+                        print(f"[Viewer] Failed to load tracks.npz: {e}")
             
             self.update_keyframes()
             
@@ -843,6 +856,11 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
     masks_dir = os.path.join(project_dir, 'masks')
     
     print(f"[TrackingWorker] Sampling {points_per_frame} points per frame for {len(sample_frames)} frames...", flush=True)
+    # Sample from the mask union across sample frames to find robustly trackable pixels,
+    # but assign all queries to frame 0 so all points are active from the very first frame.
+    # This guarantees a flat, consistent point count across the entire timeline.
+    combined_valid_x = []
+    combined_valid_y = []
     
     for t in sample_frames:
         mask_path = os.path.join(masks_dir, f"{os.path.splitext(os.path.basename(exr_files[t]))[0]}_mask.png")
@@ -856,13 +874,22 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
         else:
             valid_y, valid_x = np.mgrid[0:native_h, 0:native_w]
             valid_y, valid_x = valid_y.flatten(), valid_x.flatten()
-            
-        if len(valid_x) > 0:
-            num_samples = min(points_per_frame, len(valid_x))
-            indices = np.random.choice(len(valid_x), num_samples, replace=False)
-            for idx in indices:
-                # Downscale coordinates to proxy space for CoTracker
-                queries.append([t, valid_x[idx] / scale_x, valid_y[idx] / scale_y])
+        
+        combined_valid_x.append(valid_x)
+        combined_valid_y.append(valid_y)
+    
+    if combined_valid_x:
+        all_x = np.concatenate(combined_valid_x)
+        all_y = np.concatenate(combined_valid_y)
+        # Deduplicate coordinate pairs
+        coords = np.unique(np.stack([all_x, all_y], axis=1), axis=0)
+        all_x, all_y = coords[:, 0], coords[:, 1]
+        
+        num_samples = min(max_points, len(all_x))
+        chosen = np.random.choice(len(all_x), num_samples, replace=False)
+        for idx in chosen:
+            # All queries at frame 0 — gives consistent point count on every frame
+            queries.append([0, all_x[idx] / scale_x, all_y[idx] / scale_y])
                 
     if not queries:
         res_queue.put({"status": "error", "message": "No valid trackable points found across the sequence."})
@@ -1307,7 +1334,7 @@ class MainWindow(QMainWindow):
         top_layout.addStretch()
         layout.addLayout(top_layout)
         
-        self.tracking_viewer = SequenceViewerWidget(interactive=False)
+        self.tracking_viewer = SequenceViewerWidget(interactive=False, show_tracks=True)
         layout.addWidget(self.tracking_viewer, stretch=1)
         
         self.tracking_tab.setLayout(layout)
