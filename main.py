@@ -1094,7 +1094,7 @@ def run_vggsfm_worker(project_dir, proxies_dir, tracks_npz, camera_data, model_p
         if os.path.exists(db_path):
             os.remove(db_path)
             
-        db = pycolmap.Database(db_path)
+        db = pycolmap.Database.open(db_path)
 
         camera = pycolmap.Camera(
             model="PINHOLE",
@@ -1142,11 +1142,9 @@ def run_vggsfm_worker(project_dir, proxies_dir, tracks_npz, camera_data, model_p
 
         res_queue.put({"status": "solve_progress", "value": 45, "message": "Verifying two-view geometry (RANSAC)..."})
 
-        verification_options = pycolmap.GeometricVerifierOptions()
-        verification_options.estimate_twoview_geometry = True
-        pycolmap.verify_matches(db_path, verification_options)
+        pycolmap.geometric_verification(db_path)
 
-        res_queue.put({"status": "solve_progress", "value": 60, "message": "Executing Incremental SfM and Bundle Adjustment..."})
+        res_queue.put({"status": "solve_progress", "value": 60, "message": "Executing Incremental Bundle Adjustment... (This may take several minutes depending on sequence length)"})
 
         mapper_options = pycolmap.IncrementalPipelineOptions()
         mapper_options.min_model_size = 3
@@ -1154,10 +1152,19 @@ def run_vggsfm_worker(project_dir, proxies_dir, tracks_npz, camera_data, model_p
         mapper_options.ba_refine_extra_params = auto_estimate
         mapper_options.ba_local_max_num_iterations = 25
         mapper_options.ba_global_max_num_iterations = 50
+        mapper_options.ba_use_gpu = True
+        
+        # Relax initialization constraints for AI tracks with potentially low parallax
+        mapper_options.mapper.init_min_tri_angle = 0.1
+        mapper_options.mapper.init_min_num_inliers = 15
+        mapper_options.mapper.init_max_forward_motion = 0.99
+        mapper_options.mapper.abs_pose_min_num_inliers = 15
+        mapper_options.mapper.abs_pose_min_inlier_ratio = 0.1
+        mapper_options.triangulation.min_angle = 1.5
 
         recs = pycolmap.incremental_mapping(
             database_path=db_path, 
-            image_path="",
+            image_path=proxies_dir,
             output_path=temp_dir, 
             options=mapper_options
         )
@@ -1193,8 +1200,8 @@ def run_vggsfm_worker(project_dir, proxies_dir, tracks_npz, camera_data, model_p
             img_id = i + 1 
             if img_id in rec.images:
                 img = rec.images[img_id]
-                out_cameras_rot[i] = img.cam_from_world.rotation.matrix()
-                out_cameras_trans[i] = img.cam_from_world.translation
+                out_cameras_rot[i] = img.cam_from_world().rotation.matrix()
+                out_cameras_trans[i] = img.cam_from_world().translation
             else:
                 out_cameras_rot[i] = np.eye(3)
                 out_cameras_trans[i] = np.zeros(3)
@@ -1688,10 +1695,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please create or load a project first.")
             return
             
+        undistorted_w, undistorted_h = self.native_sizes[0] if hasattr(self, 'native_sizes') and self.native_sizes else (1920, 1080)
+        
         self.camera_setup_data = {
             "effective_sensor_width": getattr(self, 'current_eff_sensor_width', 36.0),
             "focal_length": self.spin_focal.value() if not self.chk_auto_focal.isChecked() else "auto",
-            "auto_estimate_focal": self.chk_auto_focal.isChecked()
+            "auto_estimate_focal": self.chk_auto_focal.isChecked(),
+            "plate_width": undistorted_w,
+            "plate_height": undistorted_h,
+            "ui_camera_name": self.combo_cameras.currentText(),
+            "ui_orig_w": self.spin_orig_w.value(),
+            "ui_orig_h": self.spin_orig_h.value(),
+            "ui_assume_no_crop": self.chk_assume_no_crop.isChecked(),
+            "ui_focal_val": self.spin_focal.value()
         }
         self.save_project()
         self.tabs.setCurrentWidget(self.solve_tab)
@@ -1815,6 +1831,19 @@ class MainWindow(QMainWindow):
             self.proxy_res = data.get("proxy_res", 1536)
             self.native_sizes = data.get("native_sizes", [])
             self.camera_setup_data = data.get("camera_setup_data", {})
+            
+            if self.camera_setup_data:
+                cam_name = self.camera_setup_data.get("ui_camera_name", "")
+                if cam_name:
+                    idx = self.combo_cameras.findText(cam_name)
+                    if idx >= 0:
+                        self.combo_cameras.setCurrentIndex(idx)
+                
+                self.chk_assume_no_crop.setChecked(self.camera_setup_data.get("ui_assume_no_crop", True))
+                self.spin_orig_w.setValue(self.camera_setup_data.get("ui_orig_w", 1920))
+                self.spin_orig_h.setValue(self.camera_setup_data.get("ui_orig_h", 1080))
+                self.chk_auto_focal.setChecked(self.camera_setup_data.get("auto_estimate_focal", True))
+                self.spin_focal.setValue(self.camera_setup_data.get("ui_focal_val", 50.0))
                 
             cs_idx = self.combo_colorspace.findText(self.color_space)
             if cs_idx >= 0:
