@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QProgressBar, QLabel, 
                                QFileDialog, QTabWidget, QMessageBox, QGraphicsView,
                                QGraphicsScene, QSlider, QComboBox, QGroupBox, QGridLayout, QSpinBox,
-                               QInputDialog, QDialog)
+                               QInputDialog, QDialog, QCheckBox)
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen
 from PySide6.QtCore import QTimer, Qt, QPointF, QThread, Signal
 
@@ -1043,6 +1043,181 @@ def run_tracking_worker(project_dir, exr_files, color_space, model_path, res_que
         
     res_queue.put({"status": "track_done"})
 
+def run_vggsfm_worker(project_dir, proxies_dir, tracks_npz, camera_data, model_path, res_queue):
+    """
+    Isolated worker for running 3D Bundle Adjustment and Triangulation using PyCOLMAP
+    on the pre-computed tracks from Phase 3.
+    """
+    try:
+        import os
+        import tempfile
+        import numpy as np
+        import pycolmap
+        
+        res_queue.put({"status": "solve_progress", "value": 5, "message": "Loading tracks and configuring solver..."})
+        print("[VGGSfMWorker] Loading tracks for PyCOLMAP...", flush=True)
+
+        if not os.path.exists(tracks_npz):
+            raise FileNotFoundError(f"Tracks file not found at {tracks_npz}")
+
+        # Load Tracks
+        data = np.load(tracks_npz)
+        tracks_2d = data['tracks']  # (S, N, 2)
+        visibility = data['visibility']  # (S, N)
+        S, N, _ = tracks_2d.shape
+
+        # Retrieve Camera Properties
+        eff_width = camera_data.get('effective_sensor_width', 36.0)
+        eff_height = camera_data.get('effective_sensor_height', 24.0)
+        focal_length_in = camera_data.get('focal_length', 'auto')
+        auto_estimate = camera_data.get('auto_estimate_focal', True)
+        
+        # Original plate resolution
+        plate_w = camera_data.get('plate_width', 1920)
+        plate_h = camera_data.get('plate_height', 1080)
+        
+        # Calculate focal length in pixels
+        if focal_length_in == 'auto' or auto_estimate:
+            focal_length = 50.0  # Safe default to start BA
+        else:
+            focal_length = float(focal_length_in)
+            
+        focal_px_x = (focal_length / eff_width) * plate_w
+        focal_px_y = (focal_length / eff_height) * plate_h
+        focal_px = (focal_px_x + focal_px_y) / 2.0
+
+        res_queue.put({"status": "solve_progress", "value": 15, "message": "Building PyCOLMAP Database from tracks..."})
+
+        # 2. Camera Initialization & Database Setup
+        temp_dir = tempfile.mkdtemp(prefix="colmap_")
+        db_path = os.path.join(temp_dir, "database.db")
+        if os.path.exists(db_path):
+            os.remove(db_path)
+            
+        db = pycolmap.Database(db_path)
+
+        camera = pycolmap.Camera(
+            model="PINHOLE",
+            width=int(plate_w),
+            height=int(plate_h),
+            params=[focal_px, focal_px, plate_w / 2.0, plate_h / 2.0]
+        )
+        camera.has_prior_focal_length = not auto_estimate
+        cam_id = db.write_camera(camera)
+
+        keypoint_maps = [] # Maps (img_id) -> {track_idx: kp_idx}
+        
+        for i in range(S):
+            img_name = f"frame_{i:04d}.jpg"
+            img_id = db.write_image(pycolmap.Image(name=img_name, camera_id=cam_id))
+            
+            vis_i = visibility[i] > 0
+            valid_track_indices = np.where(vis_i)[0]
+            pts = tracks_2d[i, vis_i]
+            
+            db.write_keypoints(img_id, pts.astype(np.float64))
+            
+            kp_map = {track_idx: kp_idx for kp_idx, track_idx in enumerate(valid_track_indices)}
+            keypoint_maps.append((img_id, kp_map))
+
+        res_queue.put({"status": "solve_progress", "value": 30, "message": "Generating exhaustive two-view matches..."})
+
+        for i in range(S):
+            img_id_i, map_i = keypoint_maps[i]
+            for j in range(i + 1, S):
+                img_id_j, map_j = keypoint_maps[j]
+                
+                common_tracks = set(map_i.keys()).intersection(set(map_j.keys()))
+                if len(common_tracks) < 15:
+                    continue
+                    
+                matches = []
+                for t in common_tracks:
+                    matches.append([map_i[t], map_j[t]])
+                
+                matches = np.array(matches, dtype=np.uint32)
+                db.write_matches(img_id_i, img_id_j, matches)
+
+        db.close()
+
+        res_queue.put({"status": "solve_progress", "value": 45, "message": "Verifying two-view geometry (RANSAC)..."})
+
+        verification_options = pycolmap.GeometricVerifierOptions()
+        verification_options.estimate_twoview_geometry = True
+        pycolmap.verify_matches(db_path, verification_options)
+
+        res_queue.put({"status": "solve_progress", "value": 60, "message": "Executing Incremental SfM and Bundle Adjustment..."})
+
+        mapper_options = pycolmap.IncrementalPipelineOptions()
+        mapper_options.min_model_size = 3
+        mapper_options.ba_refine_focal_length = auto_estimate
+        mapper_options.ba_refine_extra_params = auto_estimate
+        mapper_options.ba_local_max_num_iterations = 25
+        mapper_options.ba_global_max_num_iterations = 50
+
+        recs = pycolmap.incremental_mapping(
+            database_path=db_path, 
+            image_path="",
+            output_path=temp_dir, 
+            options=mapper_options
+        )
+
+        if not recs or len(recs) == 0:
+            raise RuntimeError("PyCOLMAP failed to reconstruct the scene. Not enough overlapping tracks.")
+
+        rec = recs[0]
+        res_queue.put({"status": "solve_progress", "value": 85, "message": "Reconstruction complete. Serializing data..."})
+
+        out_pts = np.zeros((N, 3), dtype=np.float32)
+        out_errs = np.zeros(N, dtype=np.float32)
+        out_mask = np.zeros(N, dtype=bool)
+
+        for img_id, image in rec.images.items():
+            _, map_i = keypoint_maps[img_id - 1]
+            rev_map_i = {v: k for k, v in map_i.items()}
+            
+            for kp_idx, p2d in enumerate(image.points2D):
+                if p2d.has_point3D():
+                    p3d_id = p2d.point3D_id
+                    track_idx = rev_map_i.get(kp_idx)
+                    if track_idx is not None and not out_mask[track_idx]:
+                        p3d = rec.points3D[p3d_id]
+                        out_pts[track_idx] = p3d.xyz
+                        out_errs[track_idx] = p3d.error
+                        out_mask[track_idx] = True
+
+        out_cameras_rot = np.zeros((S, 3, 3), dtype=np.float32)
+        out_cameras_trans = np.zeros((S, 3), dtype=np.float32)
+
+        for i in range(S):
+            img_id = i + 1 
+            if img_id in rec.images:
+                img = rec.images[img_id]
+                out_cameras_rot[i] = img.cam_from_world.rotation.matrix()
+                out_cameras_trans[i] = img.cam_from_world.translation
+            else:
+                out_cameras_rot[i] = np.eye(3)
+                out_cameras_trans[i] = np.zeros(3)
+
+        out_data_path = os.path.join(project_dir, 'solve_data.npz')
+        np.savez(
+            out_data_path,
+            points_3d=out_pts,
+            points_error=out_errs,
+            points_mask=out_mask,
+            cameras_rot=out_cameras_rot,
+            cameras_trans=out_cameras_trans,
+            focal_px=rec.cameras[cam_id].params[0]
+        )
+
+        res_queue.put({"status": "solve_progress", "value": 100, "message": "Solver Complete!"})
+        res_queue.put({"status": "solve_done"})
+
+    except Exception as e:
+        import traceback
+        err = str(e) + "\\n" + traceback.format_exc()
+        res_queue.put({"status": "error", "message": err})
+
 class ProxyGeneratorWorker(QThread):
     progress = Signal(int)
     finished = Signal(list) # Returns native sizes
@@ -1196,6 +1371,10 @@ class MainWindow(QMainWindow):
         self.tracking_tab = QWidget()
         self.tabs.addTab(self.tracking_tab, "Tracking")
         self.init_tracking_tab()
+        
+        self.camera_setup_tab = QWidget()
+        self.tabs.addTab(self.camera_setup_tab, "Camera Setup")
+        self.init_camera_setup_tab()
         
         self.solve_tab = QWidget()
         self.tabs.addTab(self.solve_tab, "Solve")
@@ -1363,13 +1542,210 @@ class MainWindow(QMainWindow):
         
         self.tracking_tab.setLayout(layout)
 
+    def init_camera_setup_tab(self):
+        layout = QVBoxLayout()
+        
+        # Camera preset selection
+        group_camera = QGroupBox("1. Camera Profile")
+        camera_layout = QHBoxLayout()
+        self.combo_cameras = QComboBox()
+        self.lbl_sensor_info = QLabel("Physical Sensor: N/A")
+        camera_layout.addWidget(QLabel("Select Camera:"))
+        camera_layout.addWidget(self.combo_cameras)
+        camera_layout.addWidget(self.lbl_sensor_info)
+        camera_layout.addStretch()
+        group_camera.setLayout(camera_layout)
+        layout.addWidget(group_camera)
+        
+        # Original Plate Resolution
+        group_res = QGroupBox("2. Original Plate Resolution (Pre-Undistortion)")
+        res_layout = QGridLayout()
+        self.spin_orig_w = QSpinBox()
+        self.spin_orig_w.setRange(1, 16384)
+        self.spin_orig_w.setValue(3840)
+        self.spin_orig_h = QSpinBox()
+        self.spin_orig_h.setRange(1, 16384)
+        self.spin_orig_h.setValue(2160)
+        
+        self.chk_assume_no_crop = QCheckBox("Unknown / Assume No Crop")
+        
+        res_layout.addWidget(QLabel("Width:"), 0, 0)
+        res_layout.addWidget(self.spin_orig_w, 0, 1)
+        res_layout.addWidget(QLabel("Height:"), 0, 2)
+        res_layout.addWidget(self.spin_orig_h, 0, 3)
+        res_layout.addWidget(self.chk_assume_no_crop, 0, 4)
+        res_layout.setColumnStretch(5, 1)
+        group_res.setLayout(res_layout)
+        layout.addWidget(group_res)
+        
+        # Focal Length
+        group_focal = QGroupBox("3. Lens Focal Length")
+        focal_layout = QHBoxLayout()
+        self.spin_focal = QSpinBox()
+        self.spin_focal.setRange(1, 1000)
+        self.spin_focal.setValue(35)
+        self.spin_focal.setSuffix(" mm")
+        self.chk_auto_focal = QCheckBox("Auto-Estimate")
+        
+        focal_layout.addWidget(QLabel("Focal Length:"))
+        focal_layout.addWidget(self.spin_focal)
+        focal_layout.addWidget(self.chk_auto_focal)
+        focal_layout.addStretch()
+        group_focal.setLayout(focal_layout)
+        layout.addWidget(group_focal)
+        
+        # Effective Sensor Math Output
+        group_eff = QGroupBox("4. Effective Sensor Size (Calculated)")
+        eff_layout = QVBoxLayout()
+        self.lbl_eff_sensor = QLabel("Effective Sensor: N/A")
+        self.lbl_eff_sensor.setStyleSheet("font-size: 18px; font-weight: bold; color: #4CAF50;")
+        
+        self.lbl_warning = QLabel("<b>Warning:</b> Utilizing 'Unknown / Assume No Crop' or 'Auto-Estimate' fallbacks will produce a mathematically accurate projection, but physical lens properties will be fabricated and may affect downstream renders (like Z-Defocus).")
+        self.lbl_warning.setStyleSheet("color: #FF9800; font-style: italic;")
+        self.lbl_warning.setWordWrap(True)
+        
+        eff_layout.addWidget(self.lbl_eff_sensor)
+        eff_layout.addWidget(self.lbl_warning)
+        group_eff.setLayout(eff_layout)
+        layout.addWidget(group_eff)
+        
+        btn_proceed = QPushButton("Save && Proceed to Solve")
+        btn_proceed.clicked.connect(self.save_camera_setup)
+        btn_proceed.setMinimumHeight(40)
+        layout.addWidget(btn_proceed)
+        
+        layout.addStretch()
+        self.camera_setup_tab.setLayout(layout)
+        
+        # Connect signals for dynamic math updates
+        self.combo_cameras.currentIndexChanged.connect(self.update_camera_math)
+        self.spin_orig_w.valueChanged.connect(self.update_camera_math)
+        self.spin_orig_h.valueChanged.connect(self.update_camera_math)
+        self.chk_assume_no_crop.toggled.connect(self.on_assume_no_crop_toggled)
+        self.chk_auto_focal.toggled.connect(self.on_auto_focal_toggled)
+        
+        self.load_cameras_json()
+
+    def load_cameras_json(self):
+        cameras_path = os.path.join(os.path.dirname(__file__), "cameras.json")
+        if not os.path.exists(cameras_path):
+            cameras_path = os.path.join(os.getcwd(), "cameras.json")
+            
+        if os.path.exists(cameras_path):
+            try:
+                with open(cameras_path, 'r') as f:
+                    data = json.load(f)
+                    
+                self.camera_profiles = data.get("cameras", [])
+                for cam in self.camera_profiles:
+                    name = f"{cam.get('make', '')} {cam.get('model', '')} ({cam.get('format', '')})"
+                    self.combo_cameras.addItem(name, userData=cam)
+            except Exception as e:
+                print(f"Failed to load cameras.json: {e}")
+        else:
+            print("cameras.json not found")
+            self.camera_profiles = []
+
+    def on_assume_no_crop_toggled(self, checked):
+        self.spin_orig_w.setEnabled(not checked)
+        self.spin_orig_h.setEnabled(not checked)
+        self.update_camera_math()
+        
+    def on_auto_focal_toggled(self, checked):
+        self.spin_focal.setEnabled(not checked)
+
+    def update_camera_math(self):
+        cam = self.combo_cameras.currentData()
+        if not cam:
+            return
+            
+        phys_w = float(cam.get("sensor_width_mm", 36.0))
+        phys_h = float(cam.get("sensor_height_mm", 24.0))
+        
+        self.lbl_sensor_info.setText(f"Physical Sensor: {phys_w:.2f}mm x {phys_h:.2f}mm")
+        
+        if not hasattr(self, 'native_sizes') or not self.native_sizes:
+            undistorted_w, undistorted_h = 3840, 2160 # default fallback
+        else:
+            undistorted_w, undistorted_h = self.native_sizes[0]
+            
+        if self.chk_assume_no_crop.isChecked():
+            orig_w = undistorted_w
+        else:
+            orig_w = self.spin_orig_w.value()
+            
+        if orig_w == 0:
+            orig_w = 1 # prevent div by zero
+            
+        # Formula: Effective Sensor Width = Physical Sensor Width * (Undistorted EXR Width / Original Plate Width)
+        eff_w = phys_w * (undistorted_w / orig_w)
+        
+        self.lbl_eff_sensor.setText(f"Effective Sensor Width: {eff_w:.4f} mm")
+        self.current_eff_sensor_width = eff_w
+
+    def save_camera_setup(self):
+        if not hasattr(self, 'project_file') or not self.project_file:
+            QMessageBox.warning(self, "Warning", "Please create or load a project first.")
+            return
+            
+        self.camera_setup_data = {
+            "effective_sensor_width": getattr(self, 'current_eff_sensor_width', 36.0),
+            "focal_length": self.spin_focal.value() if not self.chk_auto_focal.isChecked() else "auto",
+            "auto_estimate_focal": self.chk_auto_focal.isChecked()
+        }
+        self.save_project()
+        self.tabs.setCurrentWidget(self.solve_tab)
+        QMessageBox.information(self, "Success", "Camera settings saved to project. Ready for 3D Solve.")
+
     def init_solve_tab(self):
         layout = QVBoxLayout()
-        self.btn_start_solve = QPushButton("Start 3D Solver (Cleanup VRAM)")
-        self.btn_start_solve.clicked.connect(self.shutdown_daemon)
+        self.btn_start_solve = QPushButton("Start 3D Solver (VGGSfM)")
+        self.btn_start_solve.clicked.connect(self.run_solve)
         layout.addWidget(self.btn_start_solve)
+        
+        self.lbl_solve_status = QLabel("")
+        layout.addWidget(self.lbl_solve_status)
+        
+        self.solve_progress = QProgressBar()
+        self.solve_progress.setValue(0)
+        self.solve_progress.hide()
+        layout.addWidget(self.solve_progress)
+        
         layout.addStretch()
         self.solve_tab.setLayout(layout)
+
+    def run_solve(self):
+        if not hasattr(self, 'project_dir') or not self.project_dir:
+            QMessageBox.warning(self, "Warning", "Please load a project first.")
+            return
+            
+        if self.daemon_process and self.daemon_process.is_alive():
+            self.shutdown_daemon()
+            self.daemon_process.join(timeout=10)
+            
+        if not hasattr(self, 'camera_setup_data') or not self.camera_setup_data:
+            QMessageBox.warning(self, "Warning", "Please complete Camera Setup first.")
+            self.tabs.setCurrentWidget(self.camera_setup_tab)
+            return
+            
+        self.btn_start_solve.setEnabled(False)
+        self.solve_progress.setValue(0)
+        self.solve_progress.show()
+        self.lbl_solve_status.setText("Initializing Solver Worker...")
+        
+        self.cmd_queue = multiprocessing.Queue()
+        self.res_queue = multiprocessing.Queue()
+        
+        tracks_path = os.path.join(self.project_dir, 'tracks.npz')
+        proxies_dir = os.path.join(self.project_dir, 'proxies')
+        model_path = os.path.join(MODELS_DIR, "vggsfm", "vggsfm_v2_0_0.bin")
+        
+        self.daemon_process = multiprocessing.Process(
+            target=run_vggsfm_worker, 
+            args=(self.project_dir, proxies_dir, tracks_path, self.camera_setup_data, model_path, self.res_queue)
+        )
+        self.daemon_process.start()
+        self.timer.start(50)
 
     def on_color_space_changed(self):
         cs = self.color_space
@@ -1415,7 +1791,8 @@ class MainWindow(QMainWindow):
             "exr_files": self.exr_files,
             "color_space": getattr(self, 'color_space', CS_LINEAR_SRGB),
             "proxy_res": getattr(self, 'proxy_res', 1536),
-            "native_sizes": getattr(self, 'native_sizes', [])
+            "native_sizes": getattr(self, 'native_sizes', []),
+            "camera_setup_data": getattr(self, 'camera_setup_data', {})
         }
         with open(self.project_file, 'w') as f:
             json.dump(data, f, indent=4)
@@ -1437,6 +1814,7 @@ class MainWindow(QMainWindow):
             self.color_space = data.get("color_space", CS_LINEAR_SRGB)
             self.proxy_res = data.get("proxy_res", 1536)
             self.native_sizes = data.get("native_sizes", [])
+            self.camera_setup_data = data.get("camera_setup_data", {})
                 
             cs_idx = self.combo_colorspace.findText(self.color_space)
             if cs_idx >= 0:
@@ -1729,6 +2107,18 @@ class MainWindow(QMainWindow):
                     if hasattr(self, 'tracking_viewer'):
                         self.tracking_viewer.update_sequence(self.exr_files, getattr(self, 'color_space', CS_LINEAR_SRGB), self.project_dir)
                     QMessageBox.information(self, "Finished", "Tracking Complete!")
+                    
+                elif status == "solve_progress":
+                    self.solve_progress.show()
+                    self.solve_progress.setValue(res.get("value"))
+                    self.lbl_solve_status.setText(res.get("message", "Running Bundle Adjustment..."))
+                    
+                elif status == "solve_done":
+                    self.solve_progress.setValue(100)
+                    if hasattr(self, 'btn_start_solve'):
+                        self.btn_start_solve.setEnabled(True)
+                    self.lbl_solve_status.setText("3D Solve Complete!")
+                    QMessageBox.information(self, "Finished", "3D Solve Complete!")
             except queue.Empty:
                 pass
                 
