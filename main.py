@@ -1586,6 +1586,9 @@ class SolveViewport(QWidget):
         self.vis.add_geometry(self.origin_frame)
         self.vis.add_geometry(self.grid)
         
+        self.highlight_mesh = o3d.geometry.TriangleMesh()
+        self.vis.add_geometry(self.highlight_mesh)
+        
         def reset_to_origin(vis):
             ctr = vis.get_view_control()
             ctr.set_lookat([0.0, 0.0, 0.0])
@@ -1724,6 +1727,24 @@ class SolveViewport(QWidget):
         self.pcd.colors = o3d.utility.Vector3dVector(cols)
         self.vis.update_geometry(self.pcd)
         self.lbl_error.setText(f"Max Reprojection Error: {threshold:.1f}px")
+        
+        # Build giant physical spheres for selected points so they are obvious
+        self.vis.remove_geometry(self.highlight_mesh, reset_bounding_box=False)
+        self.highlight_mesh = o3d.geometry.TriangleMesh()
+        
+        if hasattr(self, 'selected_tracks') and self.selected_tracks:
+            cam_scale = self.slider_cam_scale.value() / 10.0 if hasattr(self, 'slider_cam_scale') else 1.0
+            radius = 0.05 * cam_scale # dynamically scale with the camera icons
+            for t_id in self.selected_tracks:
+                if t_id < len(self.full_points):
+                    pt = self.full_points[t_id]
+                    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+                    sphere.translate(pt)
+                    self.highlight_mesh += sphere
+                    
+            self.highlight_mesh.paint_uniform_color([1.0, 1.0, 0.0]) # Bright Yellow
+            
+        self.vis.add_geometry(self.highlight_mesh, reset_bounding_box=False)
 
     def update_camera_scale(self):
         if not hasattr(self, 'cameras_rot') or not hasattr(self, 'focal_px'): return
@@ -1754,6 +1775,8 @@ class SolveViewport(QWidget):
             ls.points = o3d.utility.Vector3dVector(world_pts)
             self.vis.update_geometry(ls)
             idx += 1
+            
+        self.update_error_threshold()
             
 class MainWindow(QMainWindow):
     def __init__(self):
