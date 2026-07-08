@@ -1567,6 +1567,15 @@ class SolveViewport(QWidget):
         cam_scale_layout.addWidget(self.slider_cam_scale)
         self.control_layout.addLayout(cam_scale_layout)
         
+        point_scale_layout = QHBoxLayout()
+        point_scale_layout.addWidget(QLabel("Highlight Size:"))
+        self.slider_point_scale = QSlider(Qt.Horizontal)
+        self.slider_point_scale.setRange(1, 200)
+        self.slider_point_scale.setValue(30)
+        self.slider_point_scale.valueChanged.connect(self.update_error_threshold)
+        point_scale_layout.addWidget(self.slider_point_scale)
+        self.control_layout.addLayout(point_scale_layout)
+        
         self.control_layout.addStretch()
         
         self.layout.addWidget(self.control_panel)
@@ -1733,8 +1742,8 @@ class SolveViewport(QWidget):
         self.highlight_mesh = o3d.geometry.TriangleMesh()
         
         if hasattr(self, 'selected_tracks') and self.selected_tracks:
-            cam_scale = self.slider_cam_scale.value() / 10.0 if hasattr(self, 'slider_cam_scale') else 1.0
-            radius = 0.05 * cam_scale # dynamically scale with the camera icons
+            point_scale = self.slider_point_scale.value() / 10.0 if hasattr(self, 'slider_point_scale') else 3.0
+            radius = 0.05 * point_scale
             for t_id in self.selected_tracks:
                 if t_id < len(self.full_points):
                     pt = self.full_points[t_id]
@@ -1742,6 +1751,7 @@ class SolveViewport(QWidget):
                     sphere.translate(pt)
                     self.highlight_mesh += sphere
                     
+            self.highlight_mesh.compute_vertex_normals()
             self.highlight_mesh.paint_uniform_color([1.0, 1.0, 0.0]) # Bright Yellow
             
         self.vis.add_geometry(self.highlight_mesh, reset_bounding_box=False)
