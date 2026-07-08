@@ -12,13 +12,16 @@ import OpenImageIO as oiio
 import cv2
 import math
 import shutil
+import concurrent.futures
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QProgressBar, QLabel, 
                                QFileDialog, QTabWidget, QMessageBox, QGraphicsView,
                                QGraphicsScene, QSlider, QComboBox, QGroupBox, QGridLayout, QSpinBox,
                                QInputDialog, QDialog, QCheckBox)
-from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen
+from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QWindow
 from PySide6.QtCore import QTimer, Qt, QPointF, QThread, Signal
+import win32gui
+import open3d as o3d
 
 # Directories
 MODELS_DIR = os.path.join(os.getcwd(), 'models')
@@ -1160,7 +1163,7 @@ def run_vggsfm_worker(project_dir, proxies_dir, tracks_npz, camera_data, model_p
         mapper_options.mapper.init_max_forward_motion = 0.99
         mapper_options.mapper.abs_pose_min_num_inliers = 15
         mapper_options.mapper.abs_pose_min_inlier_ratio = 0.1
-        mapper_options.triangulation.min_angle = 1.5
+        mapper_options.triangulation.min_angle = 0.1
 
         recs = pycolmap.incremental_mapping(
             database_path=db_path, 
@@ -1172,7 +1175,14 @@ def run_vggsfm_worker(project_dir, proxies_dir, tracks_npz, camera_data, model_p
         if not recs or len(recs) == 0:
             raise RuntimeError("PyCOLMAP failed to reconstruct the scene. Not enough overlapping tracks.")
 
-        rec = recs[0]
+        best_rec = None
+        max_imgs = 0
+        for r_idx, r in recs.items():
+            if r.num_images() > max_imgs:
+                max_imgs = r.num_images()
+                best_rec = r
+                
+        rec = best_rec
         res_queue.put({"status": "solve_progress", "value": 85, "message": "Reconstruction complete. Serializing data..."})
 
         out_pts = np.zeros((N, 3), dtype=np.float32)
@@ -1340,6 +1350,167 @@ class ImportDialog(QDialog):
         }
 
 # --- MAIN UI ---
+
+class SolveViewport(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.vis = o3d.visualization.Visualizer()
+        self.vis.create_window("O3D_Embedded", width=800, height=600, visible=False)
+        opt = self.vis.get_render_option()
+        opt.background_color = np.asarray([0, 0, 0])
+        opt.point_size = 2.0
+        
+        # Poll briefly to ensure window is created by OS
+        for _ in range(10):
+            self.vis.poll_events()
+            self.vis.update_renderer()
+            time.sleep(0.01)
+            
+        hwnd = win32gui.FindWindow(None, "O3D_Embedded")
+        self.layout = QHBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        
+        if hwnd:
+            window = QWindow.fromWinId(hwnd)
+            self.widget3d = QWidget.createWindowContainer(window)
+            self.layout.addWidget(self.widget3d, stretch=1)
+        else:
+            self.layout.addWidget(QLabel("Failed to embed Open3D viewport."))
+            
+        self.control_panel = QWidget()
+        self.control_layout = QVBoxLayout(self.control_panel)
+        
+        self.lbl_error = QLabel("Max Reprojection Error: 2.0px")
+        self.slider_error = QSlider(Qt.Horizontal)
+        self.slider_error.setMinimum(1)
+        self.slider_error.setMaximum(100) # 0.1 to 10.0
+        self.slider_error.setValue(20)
+        self.slider_error.valueChanged.connect(self.update_error_threshold)
+        
+        self.lbl_frame = QLabel("Current Camera: 0")
+        self.slider_frame = QSlider(Qt.Horizontal)
+        self.slider_frame.setMinimum(0)
+        self.slider_frame.setMaximum(0)
+        self.slider_frame.valueChanged.connect(self.update_active_camera)
+        
+        self.control_layout.addWidget(self.lbl_error)
+        self.control_layout.addWidget(self.slider_error)
+        self.control_layout.addWidget(QLabel("")) # Spacer
+        self.control_layout.addWidget(self.lbl_frame)
+        self.control_layout.addWidget(self.slider_frame)
+        self.control_layout.addStretch()
+        
+        self.layout.addWidget(self.control_panel)
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick_o3d)
+        self.timer.start(16)
+        
+        self.pcd = None
+        self.full_points = None
+        self.full_errors = None
+        self.full_colors = None
+        self.camera_linesets = []
+        
+    def _tick_o3d(self):
+        self.vis.poll_events()
+        self.vis.update_renderer()
+        
+    def load_solve_data(self, npz_path, camera_setup_data):
+        data = np.load(npz_path)
+        self.full_points = data['points_3d']
+        self.full_errors = data['points_error']
+        points_mask = data['points_mask']
+        cameras_rot = data['cameras_rot']
+        cameras_trans = data['cameras_trans']
+        focal_px = data['focal_px']
+        
+        self.full_points = self.full_points[points_mask]
+        self.full_errors = self.full_errors[points_mask]
+        
+        t = np.clip((self.full_errors - 0.5) / 1.5, 0.0, 1.0)
+        self.full_colors = np.zeros_like(self.full_points)
+        self.full_colors[:, 0] = t # R
+        self.full_colors[:, 1] = 1.0 - t # G
+        
+        if self.pcd is not None:
+            self.vis.remove_geometry(self.pcd)
+        for ls in self.camera_linesets:
+            self.vis.remove_geometry(ls)
+        self.camera_linesets.clear()
+        
+        self.pcd = o3d.geometry.PointCloud()
+        self.vis.add_geometry(self.pcd)
+        self.update_error_threshold()
+        
+        plate_w = camera_setup_data.get('plate_width', 1920)
+        plate_h = camera_setup_data.get('plate_height', 1080)
+        cx, cy = plate_w / 2.0, plate_h / 2.0
+        z = 0.5 
+        x_max = (plate_w - cx) / focal_px * z
+        x_min = (0 - cx) / focal_px * z
+        y_max = (plate_h - cy) / focal_px * z
+        y_min = (0 - cy) / focal_px * z
+        
+        frustum_pts = np.array([[0, 0, 0], [x_min, y_min, z], [x_max, y_min, z], [x_max, y_max, z], [x_min, y_max, z]])
+        frustum_lines = [[0,1],[0,2],[0,3],[0,4],[1,2],[2,3],[3,4],[4,1]]
+        colors = [[0.2, 0.5, 1.0] for _ in range(len(frustum_lines))]
+        
+        path_pts = []
+        for i in range(len(cameras_rot)):
+            R = cameras_rot[i]
+            T = cameras_trans[i]
+            if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)):
+                continue
+                
+            R_inv = R.T
+            cam_center = -R_inv @ T
+            path_pts.append(cam_center)
+            
+            world_pts = (R_inv @ frustum_pts.T).T + cam_center
+            ls = o3d.geometry.LineSet()
+            ls.points = o3d.utility.Vector3dVector(world_pts)
+            ls.lines = o3d.utility.Vector2iVector(frustum_lines)
+            ls.colors = o3d.utility.Vector3dVector(colors)
+            self.camera_linesets.append(ls)
+            self.vis.add_geometry(ls)
+            
+        self.slider_frame.setMaximum(max(0, len(self.camera_linesets) - 1))
+        self.slider_frame.setValue(0)
+        self.update_active_camera()
+            
+        if len(path_pts) > 1:
+            path_lines = [[j, j+1] for j in range(len(path_pts)-1)]
+            path_ls = o3d.geometry.LineSet()
+            path_ls.points = o3d.utility.Vector3dVector(np.array(path_pts))
+            path_ls.lines = o3d.utility.Vector2iVector(path_lines)
+            path_ls.colors = o3d.utility.Vector3dVector([[1,1,0] for _ in range(len(path_lines))])
+            self.vis.add_geometry(path_ls)
+            
+        self.vis.reset_view_point(True)
+        
+    def update_active_camera(self):
+        if not self.camera_linesets: return
+        idx = self.slider_frame.value()
+        self.lbl_frame.setText(f"Current Camera: {idx}")
+        for i, ls in enumerate(self.camera_linesets):
+            colors = np.asarray(ls.colors)
+            if i == idx:
+                colors[:] = [0.0, 1.0, 0.0] # Bright Green for active
+            else:
+                colors[:] = [0.15, 0.15, 0.15] # Dark grey for inactive
+            ls.colors = o3d.utility.Vector3dVector(colors)
+            self.vis.update_geometry(ls)
+        
+    def update_error_threshold(self):
+        if self.pcd is None: return
+        val = self.slider_error.value() / 10.0
+        self.lbl_error.setText(f"Max Reprojection Error: {val:.1f}px")
+        
+        mask = self.full_errors <= val
+        self.pcd.points = o3d.utility.Vector3dVector(self.full_points[mask])
+        self.pcd.colors = o3d.utility.Vector3dVector(self.full_colors[mask])
+        self.vis.update_geometry(self.pcd)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1714,21 +1885,24 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Success", "Camera settings saved to project. Ready for 3D Solve.")
 
     def init_solve_tab(self):
-        layout = QVBoxLayout()
+        self.solve_layout = QVBoxLayout()
         self.btn_start_solve = QPushButton("Start 3D Solver (VGGSfM)")
         self.btn_start_solve.clicked.connect(self.run_solve)
-        layout.addWidget(self.btn_start_solve)
+        self.solve_layout.addWidget(self.btn_start_solve)
         
         self.lbl_solve_status = QLabel("")
-        layout.addWidget(self.lbl_solve_status)
+        self.solve_layout.addWidget(self.lbl_solve_status)
         
         self.solve_progress = QProgressBar()
         self.solve_progress.setValue(0)
         self.solve_progress.hide()
-        layout.addWidget(self.solve_progress)
+        self.solve_layout.addWidget(self.solve_progress)
         
-        layout.addStretch()
-        self.solve_tab.setLayout(layout)
+        self.solve_viewport = SolveViewport()
+        self.solve_viewport.hide()
+        self.solve_layout.addWidget(self.solve_viewport, stretch=1)
+        
+        self.solve_tab.setLayout(self.solve_layout)
 
     def run_solve(self):
         if not hasattr(self, 'project_dir') or not self.project_dir:
@@ -1856,6 +2030,15 @@ class MainWindow(QMainWindow):
             self.btn_import_exr.setEnabled(True)
             self.btn_regen_proxies.setEnabled(True)
             self.lbl_file.setText(f"Project: {self.project_root} | Frames: {len(self.exr_files)}")
+            
+            if hasattr(self, 'solve_viewport'):
+                out_data_path = os.path.join(self.project_dir, 'solve_data.npz')
+                if os.path.exists(out_data_path) and self.camera_setup_data:
+                    self.solve_viewport.show()
+                    self.solve_viewport.load_solve_data(out_data_path, self.camera_setup_data)
+                    self.solve_progress.hide()
+                    self.btn_start_solve.setText("Re-Start 3D Solver (Overwrite)")
+                    self.lbl_solve_status.hide()
             
             if self.exr_files:
                 cs = self.color_space
@@ -2147,6 +2330,15 @@ class MainWindow(QMainWindow):
                     if hasattr(self, 'btn_start_solve'):
                         self.btn_start_solve.setEnabled(True)
                     self.lbl_solve_status.setText("3D Solve Complete!")
+                    
+                    out_data_path = os.path.join(self.project_dir, 'solve_data.npz')
+                    if os.path.exists(out_data_path):
+                        self.solve_viewport.show()
+                        self.solve_viewport.load_solve_data(out_data_path, self.camera_setup_data)
+                        self.solve_progress.hide()
+                        self.btn_start_solve.setText("Re-Start 3D Solver (Overwrite)")
+                        self.lbl_solve_status.hide()
+                        
                     QMessageBox.information(self, "Finished", "3D Solve Complete!")
             except queue.Empty:
                 pass
