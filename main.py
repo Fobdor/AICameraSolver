@@ -1549,6 +1549,34 @@ class SolveViewport(QWidget):
         self.full_colors = None
         self.camera_linesets = []
         
+        self.origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
+        self.grid = self.create_grid(size=20, divisions=20)
+        self.vis.add_geometry(self.origin_frame)
+        self.vis.add_geometry(self.grid)
+        
+    def create_grid(self, size=20, divisions=20):
+        lines = []
+        points = []
+        step = size / divisions
+        half = size / 2.0
+        
+        idx = 0
+        for i in range(divisions + 1):
+            val = -half + i * step
+            points.extend([[val, 0, -half], [val, 0, half]])
+            lines.append([idx, idx + 1])
+            idx += 2
+            
+            points.extend([[-half, 0, val], [half, 0, val]])
+            lines.append([idx, idx + 1])
+            idx += 2
+            
+        grid = o3d.geometry.LineSet()
+        grid.points = o3d.utility.Vector3dVector(points)
+        grid.lines = o3d.utility.Vector2iVector(lines)
+        grid.colors = o3d.utility.Vector3dVector([[0.3, 0.3, 0.3] for _ in range(len(lines))])
+        return grid
+        
     def _tick_o3d(self):
         self.vis.poll_events()
         self.vis.update_renderer()
