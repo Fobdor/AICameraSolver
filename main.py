@@ -2095,8 +2095,6 @@ class MainWindow(QMainWindow):
         if track_id in self.selected_tracks:
             self.selected_tracks.remove(track_id)
         else:
-            if len(self.selected_tracks) >= 3:
-                self.selected_tracks.pop(0)
             self.selected_tracks.append(track_id)
         self.update_selection_ui()
         
