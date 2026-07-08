@@ -2214,6 +2214,13 @@ class MainWindow(QMainWindow):
         for i in range(len(data['cameras_rot'])):
             data['cameras_rot'][i] = data['cameras_rot'][i] @ R.T
             
+        # Translate the rotated centroid to exactly (0, 0, 0)
+        rotated_pts = pts @ R.T
+        new_centroid = np.mean(rotated_pts, axis=0)
+        data['points_3d'] -= new_centroid
+        for i in range(len(data['cameras_trans'])):
+            data['cameras_trans'][i] += data['cameras_rot'][i] @ new_centroid
+            
         np.savez(data_path, **data)
         self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
         self.load_2d_solve_data(data_path)
