@@ -1528,7 +1528,7 @@ class SolveViewport(QWidget):
         self.spin_scale = QDoubleSpinBox()
         self.spin_scale.setRange(0.001, 9999.0)
         self.spin_scale.setValue(1.0)
-        scale_layout.addWidget(QLabel("Dist (units):"))
+        scale_layout.addWidget(QLabel("Dist (meters):"))
         scale_layout.addWidget(self.spin_scale)
         self.btn_scale = QPushButton("Set Scale (2 pts)")
         self.btn_scale.clicked.connect(lambda: self.reqSetScale.emit(self.spin_scale.value()))
