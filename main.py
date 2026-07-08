@@ -1549,12 +1549,12 @@ class SolveViewport(QWidget):
         self.full_colors = None
         self.camera_linesets = []
         
-        self.origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
-        self.grid = self.create_grid(size=20, divisions=20)
+        self.origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0)
+        self.grid = self.create_grid(size=100, divisions=100)
         self.vis.add_geometry(self.origin_frame)
         self.vis.add_geometry(self.grid)
         
-    def create_grid(self, size=20, divisions=20):
+    def create_grid(self, size=100, divisions=100):
         lines = []
         points = []
         step = size / divisions
@@ -1611,7 +1611,7 @@ class SolveViewport(QWidget):
         plate_w = camera_setup_data.get('plate_width', 1920)
         plate_h = camera_setup_data.get('plate_height', 1080)
         cx, cy = plate_w / 2.0, plate_h / 2.0
-        z = 3.0 
+        z = 9.0 
         x_max = (plate_w - cx) / focal_px * z
         x_min = (0 - cx) / focal_px * z
         y_max = (plate_h - cy) / focal_px * z
