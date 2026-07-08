@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QProgressBar, QLabel, 
                                QFileDialog, QTabWidget, QMessageBox, QGraphicsView,
                                QGraphicsScene, QSlider, QComboBox, QGroupBox, QGridLayout, QSpinBox,
-                               QInputDialog, QDialog, QCheckBox)
+                               QInputDialog, QDialog, QCheckBox, QListWidget, QDoubleSpinBox)
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QWindow
 from PySide6.QtCore import QTimer, Qt, QPointF, QThread, Signal
 import win32gui
