@@ -1457,7 +1457,7 @@ class SolveViewport(QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.vis = o3d.visualization.Visualizer()
+        self.vis = o3d.visualization.VisualizerWithKeyCallback()
         self.vis.create_window("O3D_Embedded", width=800, height=600, visible=False)
         opt = self.vis.get_render_option()
         opt.background_color = np.asarray([0, 0, 0])
