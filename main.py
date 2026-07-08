@@ -2192,8 +2192,22 @@ class MainWindow(QMainWindow):
             return
             
         normal = normal / norm_len
-        if normal[1] < 0:
-            normal = -normal
+        
+        # Determine "Up" direction using Camera Centers
+        cam_centers = []
+        for i in range(len(data['cameras_rot'])):
+            R_cam = data['cameras_rot'][i]
+            T_cam = data['cameras_trans'][i]
+            cam_centers.append(-R_cam.T @ T_cam)
+            
+        if len(cam_centers) > 0:
+            cam_centroid = np.mean(cam_centers, axis=0)
+            dir_to_cams = cam_centroid - centroid
+            if np.dot(normal, dir_to_cams) < 0:
+                normal = -normal
+        else:
+            if normal[1] < 0:
+                normal = -normal
             
         target = np.array([0.0, 1.0, 0.0])
         v = np.cross(normal, target)
@@ -2214,12 +2228,14 @@ class MainWindow(QMainWindow):
         for i in range(len(data['cameras_rot'])):
             data['cameras_rot'][i] = data['cameras_rot'][i] @ R.T
             
-        # Translate the rotated centroid to exactly (0, 0, 0)
+        # Translate ONLY the Y axis so the ground plane is exactly at Y=0 (even with grid)
         rotated_pts = pts @ R.T
-        new_centroid = np.mean(rotated_pts, axis=0)
-        data['points_3d'] -= new_centroid
+        y_offset = np.mean(rotated_pts[:, 1])
+        offset_vec = np.array([0.0, y_offset, 0.0])
+        
+        data['points_3d'] -= offset_vec
         for i in range(len(data['cameras_trans'])):
-            data['cameras_trans'][i] += data['cameras_rot'][i] @ new_centroid
+            data['cameras_trans'][i] += data['cameras_rot'][i] @ offset_vec
             
         np.savez(data_path, **data)
         self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
