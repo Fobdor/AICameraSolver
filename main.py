@@ -259,6 +259,7 @@ class SequenceViewerWidget(QWidget):
         
         self.track_data = None
         self.track_vis = None
+        self.track_colors = None
         
         layout = QVBoxLayout(self)
         
@@ -540,6 +541,12 @@ class SequenceViewerWidget(QWidget):
                     if vis[i]:
                         draw_x = int(points[i, 0] * scale_x)
                         draw_y = int(points[i, 1] * scale_y)
+                        
+                        if self.track_colors is not None and i < len(self.track_colors):
+                            c = self.track_colors[i]
+                            painter.setPen(QPen(c, 2))
+                            painter.setBrush(c)
+                            
                         painter.drawEllipse(QPointF(draw_x, draw_y), 3, 3)
             painter.end()
             final_pixmap = display_pixmap
@@ -1281,7 +1288,9 @@ def run_vggsfm_worker(project_dir, proxies_dir, tracks_npz, camera_data, model_p
             points_mask=out_mask,
             cameras_rot=out_cameras_rot,
             cameras_trans=out_cameras_trans,
-            focal_px=rec.cameras[cam_id].params[0]
+            focal_px=rec.cameras[cam_id].params[0],
+            tracks_2d=tracks_2d,
+            visibility=visibility
         )
 
         res_queue.put({"status": "solve_progress", "value": 100, "message": "Solver Complete!"})
@@ -1409,6 +1418,8 @@ class ImportDialog(QDialog):
 # --- MAIN UI ---
 
 class SolveViewport(QWidget):
+    activeCameraChanged = Signal(int)
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self.vis = o3d.visualization.Visualizer()
@@ -1551,13 +1562,13 @@ class SolveViewport(QWidget):
         idx = self.slider_frame.value()
         self.lbl_frame.setText(f"Current Camera: {idx}")
         for i, ls in enumerate(self.camera_linesets):
-            colors = np.asarray(ls.colors)
             if i == idx:
-                colors[:] = [0.0, 1.0, 0.0] # Bright Green for active
+                ls.colors = o3d.utility.Vector3dVector([[0.0, 1.0, 0.0] for _ in range(8)])
             else:
-                colors[:] = [0.15, 0.15, 0.15] # Dark grey for inactive
-            ls.colors = o3d.utility.Vector3dVector(colors)
+                ls.colors = o3d.utility.Vector3dVector([[0.2, 0.2, 0.2] for _ in range(8)])
             self.vis.update_geometry(ls)
+            
+        self.activeCameraChanged.emit(idx)
         
     def update_error_threshold(self):
         if self.pcd is None: return
@@ -1955,11 +1966,49 @@ class MainWindow(QMainWindow):
         self.solve_progress.hide()
         self.solve_layout.addWidget(self.solve_progress)
         
+        from PySide6.QtWidgets import QSplitter
+        self.solve_splitter = QSplitter(Qt.Horizontal)
+        
+        self.solve_2d_viewport = SequenceViewerWidget(self, show_tracks=True)
+        self.solve_2d_viewport.hide()
+        
         self.solve_viewport = SolveViewport()
         self.solve_viewport.hide()
-        self.solve_layout.addWidget(self.solve_viewport, stretch=1)
+        
+        self.solve_splitter.addWidget(self.solve_2d_viewport)
+        self.solve_splitter.addWidget(self.solve_viewport)
+        self.solve_splitter.setSizes([500, 500])
+        
+        self.solve_layout.addWidget(self.solve_splitter, stretch=1)
+        
+        self.solve_viewport.activeCameraChanged.connect(self.solve_2d_viewport.on_frame_changed)
         
         self.solve_tab.setLayout(self.solve_layout)
+
+    def load_2d_solve_data(self, data_path):
+        try:
+            data = np.load(data_path)
+            if 'tracks_2d' in data and 'visibility' in data:
+                self.solve_2d_viewport.track_data = data['tracks_2d']
+                self.solve_2d_viewport.track_vis = data['visibility']
+                
+                # Color tracks: Green if triangulated successfully (points_mask is True), else Red
+                if 'points_mask' in data:
+                    points_mask = data['points_mask']
+                    colors = []
+                    for is_valid in points_mask:
+                        if is_valid:
+                            colors.append(QColor(0, 255, 0, 200)) # Green
+                        else:
+                            colors.append(QColor(255, 0, 0, 200)) # Red
+                    self.solve_2d_viewport.track_colors = colors
+                    
+                # Update the 2D viewer with the sequence and frame 0
+                cs = getattr(self, 'color_space', CS_LINEAR_SRGB)
+                self.solve_2d_viewport.update_sequence(self.exr_files, cs, self.project_dir)
+                self.solve_2d_viewport.on_frame_changed(0)
+        except Exception as e:
+            print(f"Failed to load 2D solve data: {e}")
 
     def run_solve(self):
         if not hasattr(self, 'project_dir') or not self.project_dir:
@@ -2092,8 +2141,10 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'solve_viewport'):
                 out_data_path = os.path.join(self.project_dir, 'solve_data.npz')
                 if os.path.exists(out_data_path) and self.camera_setup_data:
+                    self.solve_2d_viewport.show()
                     self.solve_viewport.show()
                     self.solve_viewport.load_solve_data(out_data_path, self.camera_setup_data)
+                    self.load_2d_solve_data(out_data_path)
                     self.solve_progress.hide()
                     self.btn_start_solve.setText("Re-Start 3D Solver (Overwrite)")
                     self.lbl_solve_status.hide()
@@ -2391,8 +2442,10 @@ class MainWindow(QMainWindow):
                     
                     out_data_path = os.path.join(self.project_dir, 'solve_data.npz')
                     if os.path.exists(out_data_path):
+                        self.solve_2d_viewport.show()
                         self.solve_viewport.show()
                         self.solve_viewport.load_solve_data(out_data_path, self.camera_setup_data)
+                        self.load_2d_solve_data(out_data_path)
                         self.solve_progress.hide()
                         self.btn_start_solve.setText("Re-Start 3D Solver (Overwrite)")
                         self.lbl_solve_status.hide()
