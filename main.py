@@ -1535,6 +1535,15 @@ class SolveViewport(QWidget):
         scale_layout.addWidget(self.btn_scale)
         self.control_layout.addLayout(scale_layout)
         
+        cam_scale_layout = QHBoxLayout()
+        cam_scale_layout.addWidget(QLabel("Cam Icon Size:"))
+        self.slider_cam_scale = QSlider(Qt.Horizontal)
+        self.slider_cam_scale.setRange(1, 100)
+        self.slider_cam_scale.setValue(90)
+        self.slider_cam_scale.valueChanged.connect(self.update_camera_scale)
+        cam_scale_layout.addWidget(self.slider_cam_scale)
+        self.control_layout.addLayout(cam_scale_layout)
+        
         self.control_layout.addStretch()
         
         self.layout.addWidget(self.control_panel)
@@ -1553,6 +1562,12 @@ class SolveViewport(QWidget):
         self.grid = self.create_grid(size=100, divisions=100)
         self.vis.add_geometry(self.origin_frame)
         self.vis.add_geometry(self.grid)
+        
+        def reset_to_origin(vis):
+            ctr = vis.get_view_control()
+            ctr.set_lookat([0.0, 0.0, 0.0])
+            return False
+        self.vis.register_key_callback(ord('F'), reset_to_origin)
         
     def create_grid(self, size=100, divisions=100):
         lines = []
@@ -1586,9 +1601,10 @@ class SolveViewport(QWidget):
         self.full_points = data['points_3d']
         self.full_errors = data['points_error']
         points_mask = data['points_mask']
-        cameras_rot = data['cameras_rot']
-        cameras_trans = data['cameras_trans']
-        focal_px = data['focal_px']
+        self.cameras_rot = data['cameras_rot']
+        self.cameras_trans = data['cameras_trans']
+        self.focal_px = data['focal_px']
+        self.camera_setup_data = camera_setup_data
         
         self.full_points = self.full_points[points_mask]
         self.full_errors = self.full_errors[points_mask]
@@ -1611,20 +1627,20 @@ class SolveViewport(QWidget):
         plate_w = camera_setup_data.get('plate_width', 1920)
         plate_h = camera_setup_data.get('plate_height', 1080)
         cx, cy = plate_w / 2.0, plate_h / 2.0
-        z = 9.0 
-        x_max = (plate_w - cx) / focal_px * z
-        x_min = (0 - cx) / focal_px * z
-        y_max = (plate_h - cy) / focal_px * z
-        y_min = (0 - cy) / focal_px * z
+        z = self.slider_cam_scale.value() / 10.0
+        x_max = (plate_w - cx) / self.focal_px * z
+        x_min = (0 - cx) / self.focal_px * z
+        y_max = (plate_h - cy) / self.focal_px * z
+        y_min = (0 - cy) / self.focal_px * z
         
         frustum_pts = np.array([[0, 0, 0], [x_min, y_min, z], [x_max, y_min, z], [x_max, y_max, z], [x_min, y_max, z]])
         frustum_lines = [[0,1],[0,2],[0,3],[0,4],[1,2],[2,3],[3,4],[4,1]]
         colors = [[0.2, 0.5, 1.0] for _ in range(len(frustum_lines))]
         
         path_pts = []
-        for i in range(len(cameras_rot)):
-            R = cameras_rot[i]
-            T = cameras_trans[i]
+        for i in range(len(self.cameras_rot)):
+            R = self.cameras_rot[i]
+            T = self.cameras_trans[i]
             if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)):
                 continue
                 
@@ -1686,6 +1702,36 @@ class SolveViewport(QWidget):
         self.vis.update_geometry(self.pcd)
         self.lbl_error.setText(f"Max Reprojection Error: {threshold:.1f}px")
 
+    def update_camera_scale(self):
+        if not hasattr(self, 'cameras_rot') or not hasattr(self, 'focal_px'): return
+        
+        plate_w = self.camera_setup_data.get('plate_width', 1920)
+        plate_h = self.camera_setup_data.get('plate_height', 1080)
+        cx, cy = plate_w / 2.0, plate_h / 2.0
+        z = self.slider_cam_scale.value() / 10.0
+        
+        x_max = (plate_w - cx) / self.focal_px * z
+        x_min = (0 - cx) / self.focal_px * z
+        y_max = (plate_h - cy) / self.focal_px * z
+        y_min = (0 - cy) / self.focal_px * z
+        
+        frustum_pts = np.array([[0, 0, 0], [x_min, y_min, z], [x_max, y_min, z], [x_max, y_max, z], [x_min, y_max, z]])
+        
+        idx = 0
+        for i in range(len(self.cameras_rot)):
+            R = self.cameras_rot[i]
+            T = self.cameras_trans[i]
+            if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)): continue
+            
+            R_inv = R.T
+            cam_center = -R_inv @ T
+            world_pts = (R_inv @ frustum_pts.T).T + cam_center
+            
+            ls = self.camera_linesets[idx]
+            ls.points = o3d.utility.Vector3dVector(world_pts)
+            self.vis.update_geometry(ls)
+            idx += 1
+            
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
