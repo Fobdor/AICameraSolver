@@ -2215,7 +2215,10 @@ class MainWindow(QMainWindow):
         c = np.dot(normal, target)
         
         if s < 1e-6:
-            R = np.eye(3)
+            if c > 0:
+                R = np.eye(3)
+            else:
+                R = np.diag([1.0, -1.0, -1.0]) # 180 rotation around X
         else:
             vx = np.array([
                 [0, -v[2], v[1]],
