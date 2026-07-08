@@ -232,7 +232,11 @@ class ClickableGraphicsView(QGraphicsView):
                         y = int(y * scale_h)
 
                 if event.button() == Qt.LeftButton:
-                    self.parent_widget.add_click(x, y, frame_idx, 1, self.parent_widget.spin_obj.value()) # 1 = Positive
+                    if event.modifiers() == Qt.ShiftModifier and self.parent_widget.show_tracks:
+                        frame_idx = getattr(self.parent_widget, 'current_frame_idx', 0)
+                        self.parent_widget.pick_track(x, y, frame_idx)
+                    else:
+                        self.parent_widget.add_click(x, y, frame_idx, 1, self.parent_widget.spin_obj.value()) # 1 = Positive
                 elif event.button() == Qt.RightButton:
                     self.parent_widget.add_click(x, y, frame_idx, 0, self.parent_widget.spin_obj.value()) # 0 = Negative
                 elif event.button() == Qt.MiddleButton or (event.modifiers() == Qt.AltModifier and event.button() == Qt.LeftButton):
@@ -243,6 +247,7 @@ class ClickableGraphicsView(QGraphicsView):
 class SequenceViewerWidget(QWidget):
     # Signals to communicate with MainWindow
     clicksUpdated = Signal(int) # emits frame_idx
+    trackPicked = Signal(int) # emits track_id
 
     def __init__(self, parent=None, interactive=False, show_tracks=False):
         super().__init__(parent)
@@ -260,6 +265,7 @@ class SequenceViewerWidget(QWidget):
         self.track_data = None
         self.track_vis = None
         self.track_colors = None
+        self.current_frame_idx = 0
         
         layout = QVBoxLayout(self)
         
@@ -395,6 +401,26 @@ class SequenceViewerWidget(QWidget):
         self.on_frame_changed(self.slider.value())
         self.clicksUpdated.emit(-1)
 
+    def pick_track(self, x, y, frame_idx):
+        if self.track_data is None or self.track_vis is None:
+            return
+        if frame_idx >= self.track_data.shape[0]:
+            return
+            
+        points = self.track_data[frame_idx]
+        vis = self.track_vis[frame_idx]
+        
+        valid_indices = np.where(vis)[0]
+        if len(valid_indices) == 0:
+            return
+            
+        valid_points = points[valid_indices]
+        dists = np.linalg.norm(valid_points - np.array([x, y]), axis=1)
+        min_idx = np.argmin(dists)
+        if dists[min_idx] < 20.0: # 20 pixels tolerance
+            track_id = valid_indices[min_idx]
+            self.trackPicked.emit(int(track_id))
+
     def update_sequence(self, file_list, color_space, project_dir):
         self.exr_files = file_list
         self.color_space = color_space
@@ -464,6 +490,8 @@ class SequenceViewerWidget(QWidget):
     def on_frame_changed(self, index):
         if not self.exr_files or index < 0 or index >= len(self.exr_files):
             return
+            
+        self.current_frame_idx = index
             
         frame_path = self.exr_files[index]
         
@@ -1419,6 +1447,10 @@ class ImportDialog(QDialog):
 
 class SolveViewport(QWidget):
     activeCameraChanged = Signal(int)
+    reqClearSelection = Signal()
+    reqSetGround = Signal()
+    reqSetOrigin = Signal()
+    reqSetScale = Signal(float)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1466,6 +1498,40 @@ class SolveViewport(QWidget):
         self.control_layout.addWidget(QLabel("")) # Spacer
         self.control_layout.addWidget(self.lbl_frame)
         self.control_layout.addWidget(self.slider_frame)
+        
+        # --- NEW: Orientation & Scale UI ---
+        self.control_layout.addWidget(QLabel("")) # Spacer
+        self.control_layout.addWidget(QLabel("Selected Points:"))
+        self.list_selection = QListWidget()
+        self.list_selection.setMaximumHeight(80)
+        self.control_layout.addWidget(self.list_selection)
+        
+        self.btn_clear_sel = QPushButton("Clear Selection")
+        self.btn_clear_sel.clicked.connect(self.reqClearSelection.emit)
+        self.control_layout.addWidget(self.btn_clear_sel)
+        
+        self.control_layout.addWidget(QLabel("")) # Spacer
+        self.control_layout.addWidget(QLabel("Orientation Tools:"))
+        
+        self.btn_ground = QPushButton("Set Ground Plane (3 pts)")
+        self.btn_ground.clicked.connect(self.reqSetGround.emit)
+        self.control_layout.addWidget(self.btn_ground)
+        
+        self.btn_origin = QPushButton("Set Origin (1 pt)")
+        self.btn_origin.clicked.connect(self.reqSetOrigin.emit)
+        self.control_layout.addWidget(self.btn_origin)
+        
+        scale_layout = QHBoxLayout()
+        self.spin_scale = QDoubleSpinBox()
+        self.spin_scale.setRange(0.001, 9999.0)
+        self.spin_scale.setValue(1.0)
+        scale_layout.addWidget(QLabel("Dist:"))
+        scale_layout.addWidget(self.spin_scale)
+        self.btn_scale = QPushButton("Set Scale (2 pts)")
+        self.btn_scale.clicked.connect(lambda: self.reqSetScale.emit(self.spin_scale.value()))
+        scale_layout.addWidget(self.btn_scale)
+        self.control_layout.addLayout(scale_layout)
+        
         self.control_layout.addStretch()
         
         self.layout.addWidget(self.control_panel)
@@ -1571,14 +1637,23 @@ class SolveViewport(QWidget):
         self.activeCameraChanged.emit(idx)
         
     def update_error_threshold(self):
-        if self.pcd is None: return
-        val = self.slider_error.value() / 10.0
-        self.lbl_error.setText(f"Max Reprojection Error: {val:.1f}px")
+        if self.pcd is None or self.full_points is None: return
+        threshold = self.slider_error.value() / 10.0
         
-        mask = self.full_errors <= val
-        self.pcd.points = o3d.utility.Vector3dVector(self.full_points[mask])
-        self.pcd.colors = o3d.utility.Vector3dVector(self.full_colors[mask])
+        valid_idx = np.where(self.full_errors <= threshold)[0]
+        pts = self.full_points[valid_idx]
+        cols = self.full_colors[valid_idx].copy()
+        
+        if hasattr(self, 'selected_tracks') and self.selected_tracks:
+            for t_id in self.selected_tracks:
+                idx_in_valid = np.where(valid_idx == t_id)[0]
+                if len(idx_in_valid) > 0:
+                    cols[idx_in_valid[0]] = [1.0, 1.0, 0.0] # Yellow
+                    
+        self.pcd.points = o3d.utility.Vector3dVector(pts)
+        self.pcd.colors = o3d.utility.Vector3dVector(cols)
         self.vis.update_geometry(self.pcd)
+        self.lbl_error.setText(f"Max Reprojection Error: {threshold:.1f}px")
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1971,6 +2046,7 @@ class MainWindow(QMainWindow):
         
         self.solve_2d_viewport = SequenceViewerWidget(self, show_tracks=True)
         self.solve_2d_viewport.hide()
+        self.solve_2d_viewport.trackPicked.connect(self.on_track_picked)
         
         self.solve_viewport = SolveViewport()
         self.solve_viewport.hide()
@@ -1983,6 +2059,13 @@ class MainWindow(QMainWindow):
         
         self.solve_viewport.activeCameraChanged.connect(self.solve_2d_viewport.on_frame_changed)
         self.solve_viewport.slider_error.valueChanged.connect(self.update_2d_solve_colors)
+        
+        self.solve_viewport.reqClearSelection.connect(self.clear_selection)
+        self.solve_viewport.reqSetGround.connect(self.math_set_ground)
+        self.solve_viewport.reqSetOrigin.connect(self.math_set_origin)
+        self.solve_viewport.reqSetScale.connect(self.math_set_scale)
+        
+        self.selected_tracks = []
         
         self.solve_tab.setLayout(self.solve_layout)
 
@@ -2005,6 +2088,28 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Failed to load 2D solve data: {e}")
 
+    def on_track_picked(self, track_id):
+        if track_id in self.selected_tracks:
+            self.selected_tracks.remove(track_id)
+        else:
+            if len(self.selected_tracks) >= 3:
+                self.selected_tracks.pop(0)
+            self.selected_tracks.append(track_id)
+        self.update_selection_ui()
+        
+    def clear_selection(self):
+        self.selected_tracks.clear()
+        self.update_selection_ui()
+        
+    def update_selection_ui(self):
+        self.solve_viewport.list_selection.clear()
+        for t_id in self.selected_tracks:
+            self.solve_viewport.list_selection.addItem(f"Track ID: {t_id}")
+            
+        self.solve_viewport.selected_tracks = self.selected_tracks
+        self.solve_viewport.update_error_threshold()
+        self.update_2d_solve_colors()
+
     def update_2d_solve_colors(self, slider_val=None):
         if not hasattr(self, 'solve_2d_points_mask') or not hasattr(self, 'solve_2d_points_error'):
             return
@@ -2018,7 +2123,9 @@ class MainWindow(QMainWindow):
             is_valid = self.solve_2d_points_mask[i]
             err = self.solve_2d_points_error[i]
             
-            if is_valid and err <= threshold:
+            if i in self.selected_tracks:
+                colors.append(QColor(255, 255, 0, 255)) # Yellow (Selected)
+            elif is_valid and err <= threshold:
                 colors.append(QColor(0, 255, 0, 200)) # Green (Valid)
             else:
                 colors.append(QColor(255, 0, 0, 100)) # Red (Filtered/Rejected)
@@ -2028,6 +2135,104 @@ class MainWindow(QMainWindow):
         # Redraw current frame
         current_frame = self.solve_viewport.slider_frame.value()
         self.solve_2d_viewport.on_frame_changed(current_frame)
+
+    def math_set_ground(self):
+        if len(self.selected_tracks) != 3:
+            QMessageBox.warning(self, "Warning", "Please select exactly 3 points to define the ground plane.")
+            return
+            
+        data_path = os.path.join(self.project_dir, 'solve_data.npz')
+        if not os.path.exists(data_path): return
+        data = dict(np.load(data_path))
+        
+        # Valid track ids?
+        p1 = data['points_3d'][self.selected_tracks[0]]
+        p2 = data['points_3d'][self.selected_tracks[1]]
+        p3 = data['points_3d'][self.selected_tracks[2]]
+        
+        v1 = p2 - p1
+        v2 = p3 - p1
+        
+        normal = np.cross(v1, v2)
+        norm_len = np.linalg.norm(normal)
+        if norm_len < 1e-6:
+            QMessageBox.warning(self, "Warning", "Selected points are collinear.")
+            return
+            
+        normal = normal / norm_len
+        if normal[1] < 0:
+            normal = -normal
+            
+        target = np.array([0.0, 1.0, 0.0])
+        v = np.cross(normal, target)
+        s = np.linalg.norm(v)
+        c = np.dot(normal, target)
+        
+        if s < 1e-6:
+            R = np.eye(3)
+        else:
+            vx = np.array([
+                [0, -v[2], v[1]],
+                [v[2], 0, -v[0]],
+                [-v[1], v[0], 0]
+            ])
+            R = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s ** 2))
+            
+        data['points_3d'] = data['points_3d'] @ R.T
+        for i in range(len(data['cameras_rot'])):
+            data['cameras_rot'][i] = data['cameras_rot'][i] @ R.T
+            
+        np.savez(data_path, **data)
+        self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
+        self.load_2d_solve_data(data_path)
+        self.solve_viewport.update_error_threshold()
+        
+    def math_set_origin(self):
+        if len(self.selected_tracks) != 1:
+            QMessageBox.warning(self, "Warning", "Please select exactly 1 point to set the origin.")
+            return
+            
+        data_path = os.path.join(self.project_dir, 'solve_data.npz')
+        if not os.path.exists(data_path): return
+        data = dict(np.load(data_path))
+        
+        origin_pt = data['points_3d'][self.selected_tracks[0]].copy()
+        
+        data['points_3d'] -= origin_pt
+        for i in range(len(data['cameras_trans'])):
+            data['cameras_trans'][i] += data['cameras_rot'][i] @ origin_pt
+            
+        np.savez(data_path, **data)
+        self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
+        self.load_2d_solve_data(data_path)
+        self.solve_viewport.update_error_threshold()
+        
+    def math_set_scale(self, distance):
+        if len(self.selected_tracks) != 2:
+            QMessageBox.warning(self, "Warning", "Please select exactly 2 points to set scale.")
+            return
+            
+        data_path = os.path.join(self.project_dir, 'solve_data.npz')
+        if not os.path.exists(data_path): return
+        data = dict(np.load(data_path))
+        
+        p1 = data['points_3d'][self.selected_tracks[0]]
+        p2 = data['points_3d'][self.selected_tracks[1]]
+        
+        current_dist = np.linalg.norm(p1 - p2)
+        if current_dist < 1e-6:
+            QMessageBox.warning(self, "Warning", "Selected points are too close.")
+            return
+            
+        multiplier = distance / current_dist
+        
+        data['points_3d'] *= multiplier
+        data['cameras_trans'] *= multiplier
+        
+        np.savez(data_path, **data)
+        self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
+        self.load_2d_solve_data(data_path)
+        self.solve_viewport.update_error_threshold()
 
     def run_solve(self):
         if not hasattr(self, 'project_dir') or not self.project_dir:
