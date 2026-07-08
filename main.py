@@ -231,16 +231,19 @@ class ClickableGraphicsView(QGraphicsView):
                         x = int(x * scale_w)
                         y = int(y * scale_h)
 
-                if event.button() == Qt.LeftButton:
-                    if event.modifiers() == Qt.ShiftModifier and self.parent_widget.show_tracks:
+                if getattr(self.parent_widget, 'show_tracks', False):
+                    if event.button() == Qt.LeftButton and event.modifiers() == Qt.ShiftModifier:
                         frame_idx = getattr(self.parent_widget, 'current_frame_idx', 0)
                         self.parent_widget.pick_track(x, y, frame_idx)
-                    else:
-                        self.parent_widget.add_click(x, y, frame_idx, 1, self.parent_widget.spin_obj.value()) # 1 = Positive
-                elif event.button() == Qt.RightButton:
-                    self.parent_widget.add_click(x, y, frame_idx, 0, self.parent_widget.spin_obj.value()) # 0 = Negative
-                elif event.button() == Qt.MiddleButton or (event.modifiers() == Qt.AltModifier and event.button() == Qt.LeftButton):
-                    self.parent_widget.remove_closest_click(x, y, frame_idx)
+                else:
+                    obj_id = getattr(self.parent_widget, 'spin_obj', None)
+                    obj_val = obj_id.value() if obj_id else 1
+                    if event.button() == Qt.LeftButton:
+                        self.parent_widget.add_click(x, y, frame_idx, 1, obj_val)
+                    elif event.button() == Qt.RightButton:
+                        self.parent_widget.add_click(x, y, frame_idx, 0, obj_val)
+                    elif event.button() == Qt.MiddleButton or (event.modifiers() == Qt.AltModifier and event.button() == Qt.LeftButton):
+                        self.parent_widget.remove_closest_click(x, y, frame_idx)
                     
         super().mousePressEvent(event)
 
@@ -1513,7 +1516,7 @@ class SolveViewport(QWidget):
         self.control_layout.addWidget(QLabel("")) # Spacer
         self.control_layout.addWidget(QLabel("Orientation Tools:"))
         
-        self.btn_ground = QPushButton("Set Ground Plane (3 pts)")
+        self.btn_ground = QPushButton("Set Ground Plane (3+ pts)")
         self.btn_ground.clicked.connect(self.reqSetGround.emit)
         self.control_layout.addWidget(self.btn_ground)
         
@@ -1525,7 +1528,7 @@ class SolveViewport(QWidget):
         self.spin_scale = QDoubleSpinBox()
         self.spin_scale.setRange(0.001, 9999.0)
         self.spin_scale.setValue(1.0)
-        scale_layout.addWidget(QLabel("Dist:"))
+        scale_layout.addWidget(QLabel("Dist (units):"))
         scale_layout.addWidget(self.spin_scale)
         self.btn_scale = QPushButton("Set Scale (2 pts)")
         self.btn_scale.clicked.connect(lambda: self.reqSetScale.emit(self.spin_scale.value()))
@@ -2044,7 +2047,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QSplitter
         self.solve_splitter = QSplitter(Qt.Horizontal)
         
-        self.solve_2d_viewport = SequenceViewerWidget(self, show_tracks=True)
+        self.solve_2d_viewport = SequenceViewerWidget(self, interactive=True, show_tracks=True)
         self.solve_2d_viewport.hide()
         self.solve_2d_viewport.trackPicked.connect(self.on_track_picked)
         
@@ -2137,26 +2140,29 @@ class MainWindow(QMainWindow):
         self.solve_2d_viewport.on_frame_changed(current_frame)
 
     def math_set_ground(self):
-        if len(self.selected_tracks) != 3:
-            QMessageBox.warning(self, "Warning", "Please select exactly 3 points to define the ground plane.")
+        if len(self.selected_tracks) < 3:
+            QMessageBox.warning(self, "Warning", "Please select 3 or more points to define the ground plane.")
             return
             
         data_path = os.path.join(self.project_dir, 'solve_data.npz')
         if not os.path.exists(data_path): return
         data = dict(np.load(data_path))
         
-        # Valid track ids?
-        p1 = data['points_3d'][self.selected_tracks[0]]
-        p2 = data['points_3d'][self.selected_tracks[1]]
-        p3 = data['points_3d'][self.selected_tracks[2]]
+        # Gather all selected points
+        pts = []
+        for t_id in self.selected_tracks:
+            pts.append(data['points_3d'][t_id])
+        pts = np.array(pts)
         
-        v1 = p2 - p1
-        v2 = p3 - p1
+        # Calculate best-fit plane using SVD
+        centroid = np.mean(pts, axis=0)
+        centered = pts - centroid
+        u, s, vh = np.linalg.svd(centered)
+        normal = vh[-1, :] # The normal is the last row of V^T
         
-        normal = np.cross(v1, v2)
         norm_len = np.linalg.norm(normal)
         if norm_len < 1e-6:
-            QMessageBox.warning(self, "Warning", "Selected points are collinear.")
+            QMessageBox.warning(self, "Warning", "Selected points do not form a valid plane.")
             return
             
         normal = normal / norm_len
