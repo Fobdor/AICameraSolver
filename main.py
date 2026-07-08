@@ -1754,6 +1754,64 @@ class SolveViewport(QWidget):
             self.highlight_mesh.compute_vertex_normals()
             self.highlight_mesh.paint_uniform_color([1.0, 1.0, 0.0]) # Bright Yellow
             
+            # Draw lines or planes based on constraint
+            if hasattr(self, 'active_constraint') and self.active_constraint:
+                ctype = self.active_constraint['type']
+                pts = []
+                for t_id in self.selected_tracks:
+                    if t_id < len(self.full_points):
+                        pts.append(self.full_points[t_id])
+                pts = np.array(pts)
+                
+                if "Line" in ctype and len(pts) == 2:
+                    cylinder = o3d.geometry.TriangleMesh.create_cylinder(radius=radius*0.5, height=np.linalg.norm(pts[0]-pts[1]))
+                    cylinder.compute_vertex_normals()
+                    cylinder.paint_uniform_color([1.0, 1.0, 0.0])
+                    # Rotate cylinder to align with line
+                    z = np.array([0.0, 0.0, 1.0])
+                    target = pts[1] - pts[0]
+                    target /= np.linalg.norm(target)
+                    v = np.cross(z, target)
+                    c = np.dot(z, target)
+                    s = np.linalg.norm(v)
+                    if s < 1e-6:
+                        R = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+                    else:
+                        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                        R = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s**2))
+                    cylinder.rotate(R, center=[0,0,0])
+                    cylinder.translate((pts[0] + pts[1]) / 2.0)
+                    self.highlight_mesh += cylinder
+                    
+                elif "Plane" in ctype and len(pts) >= 3:
+                    centroid = np.mean(pts, axis=0)
+                    centered = pts - centroid
+                    u, s_svd, vh = np.linalg.svd(centered)
+                    normal = vh[-1, :]
+                    normal = normal / np.linalg.norm(normal)
+                    
+                    plane_size = 5.0 * cam_scale
+                    box = o3d.geometry.TriangleMesh.create_box(width=plane_size, height=plane_size, depth=radius*0.2)
+                    box.translate([-plane_size/2, -plane_size/2, 0])
+                    
+                    z = np.array([0.0, 0.0, 1.0])
+                    target = normal
+                    v = np.cross(z, target)
+                    c = np.dot(z, target)
+                    s_len = np.linalg.norm(v)
+                    if s_len < 1e-6:
+                        R = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+                    else:
+                        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                        R = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s_len**2))
+                        
+                    box.rotate(R, center=[0,0,0])
+                    box.translate(centroid)
+                    box.compute_vertex_normals()
+                    box.paint_uniform_color([1.0, 1.0, 0.0])
+                    # blend it as a semi-transparent yellow? Open3D legacy doesn't do transparency easily on a per-mesh basis, so we just use wireframe or solid.
+                    self.highlight_mesh += box
+            
         self.vis.add_geometry(self.highlight_mesh, reset_bounding_box=False)
 
     def update_camera_scale(self):
@@ -2231,7 +2289,8 @@ class MainWindow(QMainWindow):
         self.update_selection_ui()
         
     def clear_selection(self):
-        self.selected_tracks.clear()
+        self.selected_tracks = []
+        self.active_constraint = None
         self.update_selection_ui()
         
     def update_selection_ui(self):
@@ -2240,6 +2299,7 @@ class MainWindow(QMainWindow):
             self.solve_viewport.list_selection.addItem(f"Track ID: {t_id}")
             
         self.solve_viewport.selected_tracks = self.selected_tracks
+        self.solve_viewport.active_constraint = getattr(self, 'active_constraint', None)
         self.solve_viewport.update_error_threshold()
         self.update_2d_solve_colors()
 
@@ -2353,6 +2413,7 @@ class MainWindow(QMainWindow):
         if idx < 0 or idx >= len(self.orientation_constraints): return
         c = self.orientation_constraints[idx]
         self.selected_tracks = list(c['tracks'])
+        self.active_constraint = c
         self.update_selection_ui()
 
     def apply_orientation_constraints(self):
