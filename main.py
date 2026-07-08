@@ -1451,9 +1451,10 @@ class ImportDialog(QDialog):
 class SolveViewport(QWidget):
     activeCameraChanged = Signal(int)
     reqClearSelection = Signal()
-    reqSetGround = Signal()
-    reqSetOrigin = Signal()
-    reqSetScale = Signal(float)
+    reqAddConstraint = Signal(str, float)
+    reqDelConstraint = Signal(int)
+    reqApplyOrientation = Signal()
+    reqSelectConstraintIdx = Signal(int)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1516,24 +1517,46 @@ class SolveViewport(QWidget):
         self.control_layout.addWidget(QLabel("")) # Spacer
         self.control_layout.addWidget(QLabel("Orientation Tools:"))
         
-        self.btn_ground = QPushButton("Set Ground Plane (3+ pts)")
-        self.btn_ground.clicked.connect(self.reqSetGround.emit)
-        self.control_layout.addWidget(self.btn_ground)
+        self.list_orientation = QListWidget()
+        self.list_orientation.setMaximumHeight(150)
+        self.list_orientation.currentRowChanged.connect(self.reqSelectConstraintIdx.emit)
+        self.control_layout.addWidget(self.list_orientation)
         
-        self.btn_origin = QPushButton("Set Origin (1 pt)")
-        self.btn_origin.clicked.connect(self.reqSetOrigin.emit)
-        self.control_layout.addWidget(self.btn_origin)
+        row1 = QHBoxLayout()
+        self.combo_orient_type = QComboBox()
+        self.combo_orient_type.addItems([
+            "Origin (1 pt)", 
+            "Scale (2 pts)", 
+            "Ground Plane (3+ pts)", 
+            "XY Plane (2+ pts)", 
+            "YZ Plane (2+ pts)", 
+            "X Line (2 pts)", 
+            "Y Line (2 pts)", 
+            "Z Line (2 pts)"
+        ])
+        row1.addWidget(self.combo_orient_type)
         
-        scale_layout = QHBoxLayout()
-        self.spin_scale = QDoubleSpinBox()
-        self.spin_scale.setRange(0.001, 9999.0)
-        self.spin_scale.setValue(1.0)
-        scale_layout.addWidget(QLabel("Dist (meters):"))
-        scale_layout.addWidget(self.spin_scale)
-        self.btn_scale = QPushButton("Set Scale (2 pts)")
-        self.btn_scale.clicked.connect(lambda: self.reqSetScale.emit(self.spin_scale.value()))
-        scale_layout.addWidget(self.btn_scale)
-        self.control_layout.addLayout(scale_layout)
+        self.spin_orient_scale = QDoubleSpinBox()
+        self.spin_orient_scale.setRange(0.001, 9999.0)
+        self.spin_orient_scale.setValue(1.0)
+        self.spin_orient_scale.setToolTip("Target Distance for Scale constraint (meters)")
+        row1.addWidget(self.spin_orient_scale)
+        
+        self.btn_add_orient = QPushButton("Add")
+        self.btn_add_orient.clicked.connect(lambda: self.reqAddConstraint.emit(self.combo_orient_type.currentText(), self.spin_orient_scale.value()))
+        row1.addWidget(self.btn_add_orient)
+        self.control_layout.addLayout(row1)
+        
+        row2 = QHBoxLayout()
+        self.btn_del_orient = QPushButton("Delete Selected")
+        self.btn_del_orient.clicked.connect(lambda: self.reqDelConstraint.emit(self.list_orientation.currentRow()))
+        row2.addWidget(self.btn_del_orient)
+        
+        self.btn_apply_orient = QPushButton("Apply Orientation")
+        self.btn_apply_orient.setStyleSheet("font-weight: bold; color: #55ff55;")
+        self.btn_apply_orient.clicked.connect(self.reqApplyOrientation.emit)
+        row2.addWidget(self.btn_apply_orient)
+        self.control_layout.addLayout(row2)
         
         cam_scale_layout = QHBoxLayout()
         cam_scale_layout.addWidget(QLabel("Cam Icon Size:"))
@@ -2138,11 +2161,13 @@ class MainWindow(QMainWindow):
         self.solve_viewport.slider_error.valueChanged.connect(self.update_2d_solve_colors)
         
         self.solve_viewport.reqClearSelection.connect(self.clear_selection)
-        self.solve_viewport.reqSetGround.connect(self.math_set_ground)
-        self.solve_viewport.reqSetOrigin.connect(self.math_set_origin)
-        self.solve_viewport.reqSetScale.connect(self.math_set_scale)
+        self.solve_viewport.reqAddConstraint.connect(self.add_orientation_constraint)
+        self.solve_viewport.reqDelConstraint.connect(self.del_orientation_constraint)
+        self.solve_viewport.reqApplyOrientation.connect(self.apply_orientation_constraints)
+        self.solve_viewport.reqSelectConstraintIdx.connect(self.select_orientation_constraint)
         
         self.selected_tracks = []
+        self.orientation_constraints = []
         
         self.solve_tab.setLayout(self.solve_layout)
 
@@ -2211,128 +2236,215 @@ class MainWindow(QMainWindow):
         current_frame = self.solve_viewport.slider_frame.value()
         self.solve_2d_viewport.on_frame_changed(current_frame)
 
-    def math_set_ground(self):
-        if len(self.selected_tracks) < 3:
-            QMessageBox.warning(self, "Warning", "Please select 3 or more points to define the ground plane.")
+    def load_orientation_constraints(self):
+        if not hasattr(self, 'project_dir') or not self.project_dir: return
+        path = os.path.join(self.project_dir, 'orientation.json')
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    self.orientation_constraints = json.load(f)
+            except Exception:
+                self.orientation_constraints = []
+        else:
+            self.orientation_constraints = []
+        self.update_orientation_ui()
+
+    def save_orientation_constraints(self):
+        if not hasattr(self, 'project_dir') or not self.project_dir: return
+        path = os.path.join(self.project_dir, 'orientation.json')
+        with open(path, 'w') as f:
+            json.dump(self.orientation_constraints, f)
+
+    def update_orientation_ui(self):
+        self.solve_viewport.list_orientation.clear()
+        for c in self.orientation_constraints:
+            desc = f"{c['type']} - Tracks: {c['tracks']}"
+            if c['type'] == 'Scale (2 pts)':
+                desc += f" ({c['scale_dist']}m)"
+            self.solve_viewport.list_orientation.addItem(desc)
+
+    def add_orientation_constraint(self, ctype, scale_dist):
+        if not self.selected_tracks:
+            QMessageBox.warning(self, "Warning", "Please select tracks first.")
             return
             
+        tracks = list(self.selected_tracks)
+        
+        # Validation
+        if ctype == "Origin (1 pt)":
+            if len(tracks) != 1:
+                QMessageBox.warning(self, "Warning", "Origin requires exactly 1 point.")
+                return
+            if any(c['type'] == ctype for c in self.orientation_constraints):
+                QMessageBox.warning(self, "Warning", "Only one Origin constraint is allowed.")
+                return
+        elif ctype == "Scale (2 pts)":
+            if len(tracks) != 2:
+                QMessageBox.warning(self, "Warning", "Scale requires exactly 2 points.")
+                return
+            if any(c['type'] == ctype for c in self.orientation_constraints):
+                QMessageBox.warning(self, "Warning", "Only one Scale constraint is allowed.")
+                return
+        elif ctype == "Ground Plane (3+ pts)":
+            if len(tracks) < 3:
+                QMessageBox.warning(self, "Warning", "Ground Plane requires 3 or more points.")
+                return
+            if any(c['type'] == ctype for c in self.orientation_constraints):
+                QMessageBox.warning(self, "Warning", "Only one Ground Plane constraint is allowed.")
+                return
+        elif "Plane" in ctype:
+            if len(tracks) < 2:
+                QMessageBox.warning(self, "Warning", f"{ctype} requires 2 or more points.")
+                return
+        elif "Line" in ctype:
+            if len(tracks) != 2:
+                QMessageBox.warning(self, "Warning", f"{ctype} requires exactly 2 points.")
+                return
+                
+        self.orientation_constraints.append({
+            'type': ctype,
+            'tracks': tracks,
+            'scale_dist': scale_dist
+        })
+        self.save_orientation_constraints()
+        self.update_orientation_ui()
+        self.clear_selection()
+        
+    def del_orientation_constraint(self, idx):
+        if idx < 0 or idx >= len(self.orientation_constraints): return
+        self.orientation_constraints.pop(idx)
+        self.save_orientation_constraints()
+        self.update_orientation_ui()
+        
+    def select_orientation_constraint(self, idx):
+        if idx < 0 or idx >= len(self.orientation_constraints): return
+        c = self.orientation_constraints[idx]
+        self.selected_tracks = list(c['tracks'])
+        self.update_selection_ui()
+
+    def apply_orientation_constraints(self):
+        if not hasattr(self, 'project_dir') or not self.project_dir: return
+        
         data_path = os.path.join(self.project_dir, 'solve_data.npz')
-        if not os.path.exists(data_path): return
-        data = dict(np.load(data_path))
+        raw_data_path = os.path.join(self.project_dir, 'solve_data_raw.npz')
         
-        # Gather all selected points
-        pts = []
-        for t_id in self.selected_tracks:
-            pts.append(data['points_3d'][t_id])
-        pts = np.array(pts)
+        # Ensure raw data exists
+        if not os.path.exists(raw_data_path):
+            if not os.path.exists(data_path): return
+            import shutil
+            shutil.copy2(data_path, raw_data_path)
+            
+        data = dict(np.load(raw_data_path))
+        pts_3d = data['points_3d'].copy()
         
-        # Calculate best-fit plane using SVD
-        centroid = np.mean(pts, axis=0)
-        centered = pts - centroid
-        u, s, vh = np.linalg.svd(centered)
-        normal = vh[-1, :] # The normal is the last row of V^T
-        
-        norm_len = np.linalg.norm(normal)
-        if norm_len < 1e-6:
-            QMessageBox.warning(self, "Warning", "Selected points do not form a valid plane.")
+        if not self.orientation_constraints:
+            # If no constraints, just restore raw
+            np.savez(data_path, **data)
+            self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
+            self.load_2d_solve_data(data_path)
+            self.solve_viewport.update_error_threshold()
             return
             
-        normal = normal / norm_len
+        from scipy.optimize import least_squares
+        from scipy.spatial.transform import Rotation
         
-        # Determine "Up" direction using Camera Centers
-        cam_centers = []
+        # Parameters: [s, tx, ty, tz, rx, ry, rz]
+        x0 = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        
+        def residuals(x):
+            s = x[0]
+            t = x[1:4]
+            r = x[4:7]
+            R = Rotation.from_rotvec(r).as_matrix()
+            
+            # Calculate camera centers to enforce "up" direction
+            cam_centers = []
+            for i in range(len(data['cameras_rot'])):
+                R_cam = data['cameras_rot'][i]
+                T_cam = data['cameras_trans'][i]
+                if not (np.allclose(R_cam, np.eye(3)) and np.allclose(T_cam, np.zeros(3))):
+                    cam_centers.append(-R_cam.T @ T_cam)
+            cam_centers = np.array(cam_centers)
+            if len(cam_centers) > 0:
+                cam_centers_t = s * (cam_centers @ R.T) + t
+            else:
+                cam_centers_t = np.array([[0.0, 1.0, 0.0]])
+                
+            has_ground = any(c['type'] in ["Ground Plane (3+ pts)", "XZ Plane (2+ pts)"] for c in self.orientation_constraints)
+            
+            res = []
+            for c in self.orientation_constraints:
+                tracks = c['tracks']
+                ctype = c['type']
+                
+                # Filter tracks to ensure they exist in raw data
+                valid_tracks = [tr for tr in tracks if tr < len(pts_3d)]
+                if not valid_tracks: continue
+                
+                P = pts_3d[valid_tracks]
+                P_t = s * (P @ R.T) + t
+                
+                if ctype == "Origin (1 pt)":
+                    res.extend(P_t[0].tolist())
+                elif ctype == "Scale (2 pts)" and len(P_t) == 2:
+                    dist = np.linalg.norm(P_t[0] - P_t[1])
+                    res.append(dist - c['scale_dist'])
+                elif ctype == "Ground Plane (3+ pts)" or ctype == "XZ Plane (2+ pts)":
+                    res.extend(P_t[:, 1].tolist())
+                elif ctype == "XY Plane (2+ pts)":
+                    res.extend(P_t[:, 2].tolist())
+                elif ctype == "YZ Plane (2+ pts)":
+                    res.extend(P_t[:, 0].tolist())
+                elif ctype == "X Line (2 pts)" and len(P_t) == 2:
+                    res.append(P_t[0, 1] - P_t[1, 1])
+                    res.append(P_t[0, 2] - P_t[1, 2])
+                elif ctype == "Y Line (2 pts)" and len(P_t) == 2:
+                    res.append(P_t[0, 0] - P_t[1, 0])
+                    res.append(P_t[0, 2] - P_t[1, 2])
+                elif ctype == "Z Line (2 pts)" and len(P_t) == 2:
+                    res.append(P_t[0, 0] - P_t[1, 0])
+                    res.append(P_t[0, 1] - P_t[1, 1])
+            
+            if has_ground:
+                avg_cam_y = np.mean(cam_centers_t[:, 1])
+                if avg_cam_y < 0:
+                    # Heavy penalty for being underground
+                    res.append(avg_cam_y * 1000)
+                    
+            if not res:
+                return np.zeros(7)
+            return np.array(res)
+            
+        x0_flip = np.array([1.0, 0.0, 0.0, 0.0, np.pi, 0.0, 0.0])
+        res_0 = np.sum(np.square(residuals(x0)))
+        res_flip = np.sum(np.square(residuals(x0_flip)))
+        
+        if res_flip < res_0:
+            x0 = x0_flip
+            
+        res_opt = least_squares(residuals, x0, method='lm')
+        x_opt = res_opt.x
+        
+        s = x_opt[0]
+        t = x_opt[1:4]
+        R = Rotation.from_rotvec(x_opt[4:7]).as_matrix()
+        
+        # Apply transformation
+        data['points_3d'] = s * (data['points_3d'] @ R.T) + t
+        
         for i in range(len(data['cameras_rot'])):
             R_cam = data['cameras_rot'][i]
             T_cam = data['cameras_trans'][i]
-            cam_centers.append(-R_cam.T @ T_cam)
             
-        if len(cam_centers) > 0:
-            cam_centroid = np.mean(cam_centers, axis=0)
-            dir_to_cams = cam_centroid - centroid
-            if np.dot(normal, dir_to_cams) < 0:
-                normal = -normal
-        else:
-            if normal[1] < 0:
-                normal = -normal
+            if np.allclose(R_cam, np.eye(3)) and np.allclose(T_cam, np.zeros(3)):
+                continue
+                
+            R_cam_new = R_cam @ R.T
+            T_cam_new = s * T_cam - R_cam_new @ t
             
-        target = np.array([0.0, 1.0, 0.0])
-        v = np.cross(normal, target)
-        s = np.linalg.norm(v)
-        c = np.dot(normal, target)
-        
-        if s < 1e-6:
-            if c > 0:
-                R = np.eye(3)
-            else:
-                R = np.diag([1.0, -1.0, -1.0]) # 180 rotation around X
-        else:
-            vx = np.array([
-                [0, -v[2], v[1]],
-                [v[2], 0, -v[0]],
-                [-v[1], v[0], 0]
-            ])
-            R = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s ** 2))
+            data['cameras_rot'][i] = R_cam_new
+            data['cameras_trans'][i] = T_cam_new
             
-        data['points_3d'] = data['points_3d'] @ R.T
-        for i in range(len(data['cameras_rot'])):
-            data['cameras_rot'][i] = data['cameras_rot'][i] @ R.T
-            
-        # Translate ONLY the Y axis so the ground plane is exactly at Y=0 (even with grid)
-        rotated_pts = pts @ R.T
-        y_offset = np.mean(rotated_pts[:, 1])
-        offset_vec = np.array([0.0, y_offset, 0.0])
-        
-        data['points_3d'] -= offset_vec
-        for i in range(len(data['cameras_trans'])):
-            data['cameras_trans'][i] += data['cameras_rot'][i] @ offset_vec
-            
-        np.savez(data_path, **data)
-        self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
-        self.load_2d_solve_data(data_path)
-        self.solve_viewport.update_error_threshold()
-        
-    def math_set_origin(self):
-        if len(self.selected_tracks) != 1:
-            QMessageBox.warning(self, "Warning", "Please select exactly 1 point to set the origin.")
-            return
-            
-        data_path = os.path.join(self.project_dir, 'solve_data.npz')
-        if not os.path.exists(data_path): return
-        data = dict(np.load(data_path))
-        
-        origin_pt = data['points_3d'][self.selected_tracks[0]].copy()
-        
-        data['points_3d'] -= origin_pt
-        for i in range(len(data['cameras_trans'])):
-            data['cameras_trans'][i] += data['cameras_rot'][i] @ origin_pt
-            
-        np.savez(data_path, **data)
-        self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
-        self.load_2d_solve_data(data_path)
-        self.solve_viewport.update_error_threshold()
-        
-    def math_set_scale(self, distance):
-        if len(self.selected_tracks) != 2:
-            QMessageBox.warning(self, "Warning", "Please select exactly 2 points to set scale.")
-            return
-            
-        data_path = os.path.join(self.project_dir, 'solve_data.npz')
-        if not os.path.exists(data_path): return
-        data = dict(np.load(data_path))
-        
-        p1 = data['points_3d'][self.selected_tracks[0]]
-        p2 = data['points_3d'][self.selected_tracks[1]]
-        
-        current_dist = np.linalg.norm(p1 - p2)
-        if current_dist < 1e-6:
-            QMessageBox.warning(self, "Warning", "Selected points are too close.")
-            return
-            
-        multiplier = distance / current_dist
-        
-        data['points_3d'] *= multiplier
-        data['cameras_trans'] *= multiplier
-        
         np.savez(data_path, **data)
         self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
         self.load_2d_solve_data(data_path)
@@ -2473,6 +2585,7 @@ class MainWindow(QMainWindow):
                     self.solve_viewport.show()
                     self.solve_viewport.load_solve_data(out_data_path, self.camera_setup_data)
                     self.load_2d_solve_data(out_data_path)
+                    self.load_orientation_constraints()
                     self.solve_progress.hide()
                     self.btn_start_solve.setText("Re-Start 3D Solver (Overwrite)")
                     self.lbl_solve_status.hide()
@@ -2769,11 +2882,16 @@ class MainWindow(QMainWindow):
                     self.lbl_solve_status.setText("3D Solve Complete!")
                     
                     out_data_path = os.path.join(self.project_dir, 'solve_data.npz')
+                    raw_data_path = os.path.join(self.project_dir, 'solve_data_raw.npz')
+                    if os.path.exists(raw_data_path):
+                        os.remove(raw_data_path)
+                        
                     if os.path.exists(out_data_path):
                         self.solve_2d_viewport.show()
                         self.solve_viewport.show()
                         self.solve_viewport.load_solve_data(out_data_path, self.camera_setup_data)
                         self.load_2d_solve_data(out_data_path)
+                        self.load_orientation_constraints()
                         self.solve_progress.hide()
                         self.btn_start_solve.setText("Re-Start 3D Solver (Overwrite)")
                         self.lbl_solve_status.hide()
