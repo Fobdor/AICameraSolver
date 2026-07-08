@@ -2439,9 +2439,8 @@ class MainWindow(QMainWindow):
             
             if has_ground:
                 avg_cam_y = np.mean(cam_centers_t[:, 1])
-                if avg_cam_y < 0:
-                    # Heavy penalty for being underground
-                    res.append(avg_cam_y * 1000)
+                penalty = min(0.0, avg_cam_y * 1000.0)
+                res.append(penalty)
                     
             # Regularization to prevent under-determined Jacobian failure
             res.append((x[0] - 1.0) * 1e-4)
