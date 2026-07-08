@@ -1079,6 +1079,62 @@ def run_vggsfm_worker(project_dir, proxies_dir, tracks_npz, camera_data, model_p
         plate_w = camera_data.get('plate_width', 1920)
         plate_h = camera_data.get('plate_height', 1080)
         
+        # --- TRACK RELIABILITY SCORING & SPATIAL BINNING ---
+        res_queue.put({"status": "solve_progress", "value": 10, "message": "Scoring and Binning tracks..."})
+        
+        # 1. Lifespan Calculation
+        lifespan = visibility.sum(axis=0)  # (N,)
+        
+        # 2. Motion Jitter (Acceleration Penalty)
+        if S >= 3:
+            accel = np.diff(tracks_2d, n=2, axis=0)
+            accel_mag = np.linalg.norm(accel, axis=-1)  # (S-2, N)
+            valid_accel = visibility[:-2] & visibility[1:-1] & visibility[2:]
+            accel_mag[~valid_accel] = 0.0
+            max_accel = np.max(accel_mag, axis=0)  # (N,)
+        else:
+            max_accel = np.zeros(N)
+        
+        # 3. Reliability Score
+        lifespan_weight = 1.0
+        jitter_weight = 5.0
+        score = (lifespan_weight * lifespan) - (jitter_weight * max_accel)
+        
+        # 4. Grid-Based Spatial Binning
+        first_visible_idx = np.argmax(visibility, axis=0) # (N,)
+        first_x = tracks_2d[first_visible_idx, np.arange(N), 0]
+        first_y = tracks_2d[first_visible_idx, np.arange(N), 1]
+        
+        grid_size_x, grid_size_y = 24, 24
+        cell_w = plate_w / grid_size_x
+        cell_h = plate_h / grid_size_y
+        
+        grid_x = np.clip((first_x / cell_w).astype(int), 0, grid_size_x - 1)
+        grid_y = np.clip((first_y / cell_h).astype(int), 0, grid_size_y - 1)
+        
+        selected_indices = []
+        points_per_cell = 3 # Top 3 tracks per cell
+        
+        for gy in range(grid_size_y):
+            for gx in range(grid_size_x):
+                mask = (grid_x == gx) & (grid_y == gy)
+                cell_indices = np.where(mask)[0]
+                if len(cell_indices) > 0:
+                    cell_scores = score[cell_indices]
+                    sorted_idx = np.argsort(cell_scores)[::-1]
+                    best_tracks = cell_indices[sorted_idx[:points_per_cell]]
+                    selected_indices.extend(best_tracks)
+                    
+        selected_indices = np.array(selected_indices, dtype=int)
+        
+        # 5. Final Decimation
+        if len(selected_indices) > 0:
+            tracks_2d = tracks_2d[:, selected_indices, :]
+            visibility = visibility[:, selected_indices]
+            N = tracks_2d.shape[1]
+            print(f"[VGGSfMWorker] Decimated tracks to {N} using spatial binning.", flush=True)
+        # ---------------------------------------------------
+        
         # Calculate focal length in pixels
         if focal_length_in == 'auto' or auto_estimate:
             focal_length = 50.0  # Safe default to start BA
@@ -1163,6 +1219,7 @@ def run_vggsfm_worker(project_dir, proxies_dir, tracks_npz, camera_data, model_p
         mapper_options.mapper.init_max_forward_motion = 0.99
         mapper_options.mapper.abs_pose_min_num_inliers = 15
         mapper_options.mapper.abs_pose_min_inlier_ratio = 0.1
+        mapper_options.mapper.filter_min_tri_angle = 0.1
         mapper_options.triangulation.min_angle = 0.1
 
         recs = pycolmap.incremental_mapping(
@@ -1966,6 +2023,7 @@ class MainWindow(QMainWindow):
         os.makedirs(os.path.join(self.project_dir, 'proxies'), exist_ok=True)
         os.makedirs(os.path.join(self.project_dir, 'exports'), exist_ok=True)
         os.makedirs(os.path.join(self.project_dir, 'user_masks'), exist_ok=True)
+        os.makedirs(os.path.join(self.project_root, 'user_masks_source'), exist_ok=True)
         
         self.project_file = os.path.join(self.project_root, "project.json")
         self.exr_files = []
