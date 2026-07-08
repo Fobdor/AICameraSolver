@@ -1514,7 +1514,7 @@ class SolveViewport(QWidget):
         plate_w = camera_setup_data.get('plate_width', 1920)
         plate_h = camera_setup_data.get('plate_height', 1080)
         cx, cy = plate_w / 2.0, plate_h / 2.0
-        z = 0.5 
+        z = 3.0 
         x_max = (plate_w - cx) / focal_px * z
         x_min = (0 - cx) / focal_px * z
         y_max = (plate_h - cy) / focal_px * z
@@ -1982,6 +1982,7 @@ class MainWindow(QMainWindow):
         self.solve_layout.addWidget(self.solve_splitter, stretch=1)
         
         self.solve_viewport.activeCameraChanged.connect(self.solve_2d_viewport.on_frame_changed)
+        self.solve_viewport.slider_error.valueChanged.connect(self.update_2d_solve_colors)
         
         self.solve_tab.setLayout(self.solve_layout)
 
@@ -1992,16 +1993,10 @@ class MainWindow(QMainWindow):
                 self.solve_2d_viewport.track_data = data['tracks_2d']
                 self.solve_2d_viewport.track_vis = data['visibility']
                 
-                # Color tracks: Green if triangulated successfully (points_mask is True), else Red
-                if 'points_mask' in data:
-                    points_mask = data['points_mask']
-                    colors = []
-                    for is_valid in points_mask:
-                        if is_valid:
-                            colors.append(QColor(0, 255, 0, 200)) # Green
-                        else:
-                            colors.append(QColor(255, 0, 0, 200)) # Red
-                    self.solve_2d_viewport.track_colors = colors
+                if 'points_mask' in data and 'points_error' in data:
+                    self.solve_2d_points_mask = data['points_mask']
+                    self.solve_2d_points_error = data['points_error']
+                    self.update_2d_solve_colors()
                     
                 # Update the 2D viewer with the sequence and frame 0
                 cs = getattr(self, 'color_space', CS_LINEAR_SRGB)
@@ -2009,6 +2004,30 @@ class MainWindow(QMainWindow):
                 self.solve_2d_viewport.on_frame_changed(0)
         except Exception as e:
             print(f"Failed to load 2D solve data: {e}")
+
+    def update_2d_solve_colors(self, slider_val=None):
+        if not hasattr(self, 'solve_2d_points_mask') or not hasattr(self, 'solve_2d_points_error'):
+            return
+            
+        if slider_val is None:
+            slider_val = self.solve_viewport.slider_error.value()
+            
+        threshold = slider_val / 10.0
+        colors = []
+        for i in range(len(self.solve_2d_points_mask)):
+            is_valid = self.solve_2d_points_mask[i]
+            err = self.solve_2d_points_error[i]
+            
+            if is_valid and err <= threshold:
+                colors.append(QColor(0, 255, 0, 200)) # Green (Valid)
+            else:
+                colors.append(QColor(255, 0, 0, 100)) # Red (Filtered/Rejected)
+                
+        self.solve_2d_viewport.track_colors = colors
+        
+        # Redraw current frame
+        current_frame = self.solve_viewport.slider_frame.value()
+        self.solve_2d_viewport.on_frame_changed(current_frame)
 
     def run_solve(self):
         if not hasattr(self, 'project_dir') or not self.project_dir:
