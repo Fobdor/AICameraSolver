@@ -2378,6 +2378,15 @@ class MainWindow(QMainWindow):
             s = x[0]
             t = x[1:4]
             r = x[4:7]
+            
+            has_scale = any(c['type'] == "Scale (2 pts)" for c in self.orientation_constraints)
+            if not has_scale:
+                s = 1.0
+                
+            has_rot = any(c['type'] not in ["Origin (1 pt)", "Scale (2 pts)"] for c in self.orientation_constraints)
+            if not has_rot:
+                r = np.zeros(3)
+                
             R = Rotation.from_rotvec(r).as_matrix()
             
             # Calculate camera centers to enforce "up" direction
@@ -2434,8 +2443,11 @@ class MainWindow(QMainWindow):
                     # Heavy penalty for being underground
                     res.append(avg_cam_y * 1000)
                     
-            if not res:
-                return np.zeros(7)
+            # Regularization to prevent under-determined Jacobian failure
+            res.append((x[0] - 1.0) * 1e-4)
+            res.extend((x[1:4] * 1e-4).tolist())
+            res.extend((x[4:7] * 1e-4).tolist())
+            
             return np.array(res)
             
         x0_flip = np.array([1.0, 0.0, 0.0, 0.0, np.pi, 0.0, 0.0])
@@ -2448,6 +2460,15 @@ class MainWindow(QMainWindow):
         res_opt = least_squares(residuals, x0, method='lm')
         x_opt = res_opt.x
         
+        # Manually enforce locks on the final output just in case
+        has_scale = any(c['type'] == "Scale (2 pts)" for c in self.orientation_constraints)
+        if not has_scale:
+            x_opt[0] = 1.0
+            
+        has_rot = any(c['type'] not in ["Origin (1 pt)", "Scale (2 pts)"] for c in self.orientation_constraints)
+        if not has_rot:
+            x_opt[4:7] = 0.0
+            
         s = x_opt[0]
         t = x_opt[1:4]
         R = Rotation.from_rotvec(x_opt[4:7]).as_matrix()
