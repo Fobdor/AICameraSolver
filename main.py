@@ -32,7 +32,9 @@ MODELS = {
     "sam2_hiera_large.pt": "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt",
     "cotracker3/scaled_online.pth": "https://huggingface.co/facebook/cotracker3/resolve/main/scaled_online.pth",
     "vggsfm/vggsfm_v2_0_0.bin": "https://huggingface.co/facebook/VGGSfM/resolve/main/vggsfm_v2_0_0.bin",
-    "depth_anything_v2/depth_anything_v2_vits.pth": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth"
+    "depth_anything_v2_hf/config.json": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf/resolve/main/config.json",
+    "depth_anything_v2_hf/model.safetensors": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf/resolve/main/model.safetensors",
+    "depth_anything_v2_hf/preprocessor_config.json": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf/resolve/main/preprocessor_config.json"
 }
 
 # Color Space Constants
@@ -191,8 +193,11 @@ class AIDepthWorker(QThread):
             import torch
             
             self.progress.emit(20)
-            # This will automatically download to ~/.cache/huggingface on first run
-            pipe = pipeline('depth-estimation', model='depth-anything/Depth-Anything-V2-Small-hf', device=0 if torch.cuda.is_available() else -1)
+            model_path = os.path.join(MODELS_DIR, "depth_anything_v2_hf")
+            if not os.path.exists(os.path.join(model_path, "model.safetensors")):
+                raise Exception("AI Depth Model not downloaded. Please click 'Download Setup Models' in the Setup tab.")
+                
+            pipe = pipeline('depth-estimation', model=model_path, local_files_only=True, device=0 if torch.cuda.is_available() else -1)
             
             self.progress.emit(50)
             img = Image.open(self.frame_path).convert('RGB')
@@ -2395,10 +2400,10 @@ class MainWindow(QMainWindow):
             
             for i in range(len(pts_3d)):
                 if not pts_mask[i]: continue
-                # track_2d is [N, Frames, 2]
+                # track_2d is [Frames, N, 2]
                 # We need the 2D coordinate for frame_name.
                 # Assuming frame_files[0] corresponds to track_2d index 0
-                x, y = track_2d[i, 0]
+                x, y = track_2d[0, i]
                 if x < 0 or y < 0: continue
                 
                 h, w = depth_map.shape
@@ -2426,7 +2431,7 @@ class MainWindow(QMainWindow):
             
             for i in range(len(pts_3d)):
                 if not pts_mask[i]: continue
-                x, y = track_2d[i, 0]
+                x, y = track_2d[0, i]
                 if x < 0 or y < 0: continue
                 
                 h, w = depth_map.shape
