@@ -2398,6 +2398,9 @@ class MainWindow(QMainWindow):
             ai_depths = []
             sfm_depths = []
             
+            R_cam = data['cameras_rot'][0]
+            T_cam = data['cameras_trans'][0]
+            
             for i in range(len(pts_3d)):
                 if not pts_mask[i]: continue
                 # track_2d is [Frames, N, 2]
@@ -2412,7 +2415,11 @@ class MainWindow(QMainWindow):
                     raw_ai_val = depth_map[py, px]
                     # Monocular networks usually output disparity (inverse depth). Convert to relative depth.
                     ai_z = 1.0 / (raw_ai_val + 1e-6)
-                    sfm_z = pts_3d[i, 2]
+                    
+                    # Convert world point to camera space to find true depth
+                    P_cam = R_cam @ pts_3d[i] + T_cam
+                    sfm_z = P_cam[2]
+                    
                     ai_depths.append(ai_z)
                     sfm_depths.append(sfm_z)
                     
@@ -2441,8 +2448,20 @@ class MainWindow(QMainWindow):
                     ai_z = 1.0 / (raw_ai_val + 1e-6)
                     target_z = m * ai_z + c
                     
-                    # Blend the Z axis directly (assuming Z is depth)
-                    pts_3d[i, 2] = (pts_3d[i, 2] * (1.0 - blend_factor)) + (target_z * blend_factor)
+                    P_cam = R_cam @ pts_3d[i] + T_cam
+                    current_z = P_cam[2]
+                    new_z = (current_z * (1.0 - blend_factor)) + (target_z * blend_factor)
+                    
+                    # Scale the entire camera ray to preserve 2D projection
+                    if current_z > 1e-6:
+                        scale = new_z / current_z
+                        P_cam_new = P_cam * scale
+                    else:
+                        P_cam_new = P_cam.copy()
+                        P_cam_new[2] = new_z
+                        
+                    # Transform back to world space
+                    pts_3d[i] = R_cam.T @ (P_cam_new - T_cam)
                     
             data['points_3d'] = pts_3d
             np.savez(data_path, **data)
