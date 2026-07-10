@@ -2448,9 +2448,26 @@ class MainWindow(QMainWindow):
             ai_depths = np.array(ai_depths)
             sfm_depths = np.array(sfm_depths)
             
-            # We want sfm_z = m * ai_z + c
-            A = np.vstack([ai_depths, np.ones(len(ai_depths))]).T
-            m, c = np.linalg.lstsq(A, sfm_depths, rcond=None)[0]
+            # Use robust least squares with Huber/Soft-L1 loss to ignore massive SfM outliers!
+            # We strictly bound 'm' to be positive so the depth map can NEVER be inverted.
+            from scipy.optimize import least_squares
+            
+            def depth_residuals(params):
+                m, c = params
+                return sfm_depths - (m * ai_depths + c)
+                
+            # Initial guess: simple median ratio for scale, median diff for shift
+            m_guess = np.median(sfm_depths) / (np.median(ai_depths) + 1e-6)
+            c_guess = np.median(sfm_depths) - m_guess * np.median(ai_depths)
+            
+            res = least_squares(
+                depth_residuals, 
+                [m_guess, c_guess], 
+                loss='soft_l1', 
+                f_scale=1.0, 
+                bounds=([1e-6, -np.inf], [np.inf, np.inf])
+            )
+            m, c = res.x
             
             # Now blend them!
             blend_factor = 0.5 # pull 50% towards AI mold
