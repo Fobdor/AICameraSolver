@@ -2321,6 +2321,16 @@ class MainWindow(QMainWindow):
         self.btn_ai_verify.clicked.connect(self.run_ai_depth_verification)
         solve_btn_layout.addWidget(self.btn_ai_verify)
         
+        self.lbl_ai_blend = QLabel("Smoothing Strength: 50%")
+        solve_btn_layout.addWidget(self.lbl_ai_blend)
+        
+        self.ai_blend_slider = QSlider(Qt.Horizontal)
+        self.ai_blend_slider.setRange(0, 100)
+        self.ai_blend_slider.setValue(50)
+        self.ai_blend_slider.setFixedWidth(100)
+        self.ai_blend_slider.valueChanged.connect(lambda v: self.lbl_ai_blend.setText(f"Smoothing Strength: {v}%"))
+        solve_btn_layout.addWidget(self.ai_blend_slider)
+        
         self.solve_layout.addLayout(solve_btn_layout)
         
         self.lbl_solve_status = QLabel("")
@@ -2470,7 +2480,7 @@ class MainWindow(QMainWindow):
             m, c = res.x
             
             # Now blend them!
-            blend_factor = 0.5 # pull 50% towards AI mold
+            blend_factor = self.ai_blend_slider.value() / 100.0
             
             for i in range(len(pts_3d)):
                 if not pts_mask[i]: continue
