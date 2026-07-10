@@ -31,7 +31,8 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 MODELS = {
     "sam2_hiera_large.pt": "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt",
     "cotracker3/scaled_online.pth": "https://huggingface.co/facebook/cotracker3/resolve/main/scaled_online.pth",
-    "vggsfm/vggsfm_v2_0_0.bin": "https://huggingface.co/facebook/VGGSfM/resolve/main/vggsfm_v2_0_0.bin"
+    "vggsfm/vggsfm_v2_0_0.bin": "https://huggingface.co/facebook/VGGSfM/resolve/main/vggsfm_v2_0_0.bin",
+    "depth_anything_v2/depth_anything_v2_vits.pth": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth"
 }
 
 # Color Space Constants
