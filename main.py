@@ -2386,13 +2386,15 @@ class MainWindow(QMainWindow):
         # We need to map our 3D points to the 2D frame
         try:
             pts_3d = data['points_3d']
-            track_2d = data['tracks']
+            track_2d = data['tracks_2d']
+            pts_mask = data['points_mask']
             
             # Linear Regression to align Depth map to SfM Depth
             ai_depths = []
             sfm_depths = []
             
             for i in range(len(pts_3d)):
+                if not pts_mask[i]: continue
                 # track_2d is [N, Frames, 2]
                 # We need the 2D coordinate for frame_name.
                 # Assuming frame_files[0] corresponds to track_2d index 0
@@ -2423,6 +2425,7 @@ class MainWindow(QMainWindow):
             blend_factor = 0.5 # pull 50% towards AI mold
             
             for i in range(len(pts_3d)):
+                if not pts_mask[i]: continue
                 x, y = track_2d[i, 0]
                 if x < 0 or y < 0: continue
                 
