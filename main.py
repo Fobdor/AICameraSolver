@@ -1918,6 +1918,25 @@ class SolveViewport(QWidget):
         self.update_error_threshold()
             
 class MainWindow(QMainWindow):
+    def closeEvent(self, event):
+        # Kill daemon process if running
+        if hasattr(self, 'daemon_process') and self.daemon_process and self.daemon_process.is_alive():
+            self.daemon_process.terminate()
+            self.daemon_process.join()
+            
+        # Kill workers
+        workers = ['dl_worker', 'ai_depth_worker', 'proxy_worker']
+        for w in workers:
+            if hasattr(self, w):
+                worker = getattr(self, w)
+                if worker and worker.isRunning():
+                    worker.terminate()
+                    worker.wait()
+                    
+        event.accept()
+        import sys
+        sys.exit(0)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AI Camera Tracker")
