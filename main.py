@@ -2221,9 +2221,18 @@ class MainWindow(QMainWindow):
 
     def init_solve_tab(self):
         self.solve_layout = QVBoxLayout()
+        solve_btn_layout = QHBoxLayout()
+        
         self.btn_start_solve = QPushButton("Start 3D Solver (VGGSfM)")
         self.btn_start_solve.clicked.connect(self.run_solve)
-        self.solve_layout.addWidget(self.btn_start_solve)
+        solve_btn_layout.addWidget(self.btn_start_solve)
+        
+        self.btn_ai_verify = QPushButton("AI Spatial Smoothing")
+        self.btn_ai_verify.setStyleSheet("background-color: #3b7b94; font-weight: bold; color: white;")
+        self.btn_ai_verify.clicked.connect(self.run_ai_depth_verification)
+        solve_btn_layout.addWidget(self.btn_ai_verify)
+        
+        self.solve_layout.addLayout(solve_btn_layout)
         
         self.lbl_solve_status = QLabel("")
         self.solve_layout.addWidget(self.lbl_solve_status)
@@ -2262,6 +2271,121 @@ class MainWindow(QMainWindow):
         self.orientation_constraints = []
         
         self.solve_tab.setLayout(self.solve_layout)
+
+    def run_ai_depth_verification(self):
+        if not hasattr(self, 'project_dir') or not self.project_dir:
+            QMessageBox.warning(self, "Error", "No project loaded.")
+            return
+            
+        data_path = os.path.join(self.project_dir, 'solve_data.npz')
+        if not os.path.exists(data_path):
+            QMessageBox.warning(self, "Error", "No solve data found. Run VGGSfM first.")
+            return
+            
+        data = dict(np.load(data_path))
+        
+        frames_dir = os.path.join(self.project_dir, "frames")
+        if not os.path.exists(frames_dir):
+            QMessageBox.warning(self, "Error", "No frames found.")
+            return
+            
+        frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith('.jpg') or f.endswith('.png')])
+        if not frame_files:
+            return
+            
+        frame_path = os.path.join(frames_dir, frame_files[0])
+        
+        self.btn_ai_verify.setEnabled(False)
+        self.solve_progress.show()
+        self.solve_progress.setValue(0)
+        self.lbl_solve_status.setText("Initializing AI Depth Smoothing (Downloading weights if first run)...")
+        
+        from ai_depth import AIDepthWorker
+        self.ai_depth_worker = AIDepthWorker(frame_path)
+        self.ai_depth_worker.progress.connect(self.solve_progress.setValue)
+        self.ai_depth_worker.finished.connect(lambda depth: self.on_ai_depth_finished(depth, data, data_path, frame_files[0]))
+        self.ai_depth_worker.error.connect(self.on_ai_depth_error)
+        self.ai_depth_worker.start()
+
+    def on_ai_depth_error(self, err_str):
+        self.btn_ai_verify.setEnabled(True)
+        self.solve_progress.hide()
+        self.lbl_solve_status.setText("AI Error.")
+        QMessageBox.critical(self, "AI Depth Error", err_str)
+
+    def on_ai_depth_finished(self, depth_map, data, data_path, frame_name):
+        self.btn_ai_verify.setEnabled(True)
+        self.solve_progress.hide()
+        self.lbl_solve_status.setText("AI Depth smoothing complete.")
+        
+        # We now have depth_map (numpy array HxW)
+        # We need to map our 3D points to the 2D frame
+        try:
+            pts_3d = data['points_3d']
+            track_2d = data['tracks']
+            
+            # Linear Regression to align Depth map to SfM Depth
+            ai_depths = []
+            sfm_depths = []
+            
+            for i in range(len(pts_3d)):
+                # track_2d is [N, Frames, 2]
+                # We need the 2D coordinate for frame_name.
+                # Assuming frame_files[0] corresponds to track_2d index 0
+                x, y = track_2d[i, 0]
+                if x < 0 or y < 0: continue
+                
+                h, w = depth_map.shape
+                py, px = int(round(y)), int(round(x))
+                if 0 <= px < w and 0 <= py < h:
+                    raw_ai_val = depth_map[py, px]
+                    # Monocular networks usually output disparity (inverse depth). Convert to relative depth.
+                    ai_z = 1.0 / (raw_ai_val + 1e-6)
+                    sfm_z = pts_3d[i, 2]
+                    ai_depths.append(ai_z)
+                    sfm_depths.append(sfm_z)
+                    
+            if not ai_depths:
+                raise Exception("No valid tracks found on frame 0 to align depth.")
+                
+            ai_depths = np.array(ai_depths)
+            sfm_depths = np.array(sfm_depths)
+            
+            # We want sfm_z = m * ai_z + c
+            A = np.vstack([ai_depths, np.ones(len(ai_depths))]).T
+            m, c = np.linalg.lstsq(A, sfm_depths, rcond=None)[0]
+            
+            # Now blend them!
+            blend_factor = 0.5 # pull 50% towards AI mold
+            
+            for i in range(len(pts_3d)):
+                x, y = track_2d[i, 0]
+                if x < 0 or y < 0: continue
+                
+                h, w = depth_map.shape
+                py, px = int(round(y)), int(round(x))
+                if 0 <= px < w and 0 <= py < h:
+                    raw_ai_val = depth_map[py, px]
+                    ai_z = 1.0 / (raw_ai_val + 1e-6)
+                    target_z = m * ai_z + c
+                    
+                    # Blend the Z axis directly (assuming Z is depth)
+                    pts_3d[i, 2] = (pts_3d[i, 2] * (1.0 - blend_factor)) + (target_z * blend_factor)
+                    
+            data['points_3d'] = pts_3d
+            np.savez(data_path, **data)
+            
+            # Save raw as well so the orientation solver doesn't wipe our smoothing out!
+            raw_data_path = os.path.join(self.project_dir, 'solve_data_raw.npz')
+            np.savez(raw_data_path, **data)
+            
+            self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
+            self.load_2d_solve_data(data_path)
+            QMessageBox.information(self, "AI Verification", "Point cloud spatially smoothed using AI depth priors!")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Alignment Error", str(e))
+
 
     def load_2d_solve_data(self, data_path):
         try:
