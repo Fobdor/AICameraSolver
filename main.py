@@ -1739,6 +1739,7 @@ class SolveViewport(QWidget):
         self.lbl_error.setText(f"Max Reprojection Error: {threshold:.1f}px")
         
         # Build giant physical spheres for selected points so they are obvious
+        self.vis.remove_geometry(self.highlight_mesh, reset_bounding_box=False)
         self.highlight_mesh.clear()
         
         if hasattr(self, 'selected_tracks') and self.selected_tracks:
@@ -1812,8 +1813,8 @@ class SolveViewport(QWidget):
                     box.paint_uniform_color([1.0, 1.0, 0.0]) # Yellow plane
                     self.highlight_mesh += box
             
-        # Efficient geometry update
-        self.vis.update_geometry(self.highlight_mesh)
+        # Re-add geometry because topology (vertex count) changes dynamically
+        self.vis.add_geometry(self.highlight_mesh, reset_bounding_box=False)
 
     def update_camera_scale(self):
         if not hasattr(self, 'cameras_rot') or not hasattr(self, 'focal_px'): return
