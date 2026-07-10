@@ -2518,6 +2518,10 @@ class MainWindow(QMainWindow):
         try:
             data = np.load(data_path)
             if 'tracks_2d' in data and 'visibility' in data:
+                # Update the 2D viewer with the sequence FIRST so it doesn't overwrite our decimated data
+                cs = getattr(self, 'color_space', CS_LINEAR_SRGB)
+                self.solve_2d_viewport.update_sequence(self.exr_files, cs, self.project_dir)
+                
                 self.solve_2d_viewport.track_data = data['tracks_2d']
                 self.solve_2d_viewport.track_vis = data['visibility']
                 
@@ -2526,9 +2530,6 @@ class MainWindow(QMainWindow):
                     self.solve_2d_points_error = data['points_error']
                     self.update_2d_solve_colors()
                     
-                # Update the 2D viewer with the sequence and frame 0
-                cs = getattr(self, 'color_space', CS_LINEAR_SRGB)
-                self.solve_2d_viewport.update_sequence(self.exr_files, cs, self.project_dir)
                 self.solve_2d_viewport.on_frame_changed(0)
         except Exception as e:
             print(f"Failed to load 2D solve data: {e}")
