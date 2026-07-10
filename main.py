@@ -1684,6 +1684,11 @@ class SolveViewport(QWidget):
         self.focal_px = data['focal_px']
         self.camera_setup_data = camera_setup_data
         
+        # Build mapping: original track index -> compacted index
+        valid_original_indices = np.where(points_mask)[0]
+        self.track_to_compact = {int(orig): compact for compact, orig in enumerate(valid_original_indices)}
+        self.compact_to_track = {compact: int(orig) for compact, orig in enumerate(valid_original_indices)}
+        
         self.full_points = self.full_points[points_mask]
         self.full_errors = self.full_errors[points_mask]
         
@@ -1779,9 +1784,11 @@ class SolveViewport(QWidget):
         
         if hasattr(self, 'selected_tracks') and self.selected_tracks:
             for t_id in self.selected_tracks:
-                idx_in_valid = np.where(valid_idx == t_id)[0]
-                if len(idx_in_valid) > 0:
-                    cols[idx_in_valid[0]] = [1.0, 1.0, 0.0] # Yellow
+                compact_id = self.track_to_compact.get(t_id)
+                if compact_id is not None:
+                    idx_in_valid = np.where(valid_idx == compact_id)[0]
+                    if len(idx_in_valid) > 0:
+                        cols[idx_in_valid[0]] = [1.0, 1.0, 0.0] # Yellow
                     
         self.vis.remove_geometry(self.pcd, reset_bounding_box=False)
         self.pcd = o3d.geometry.PointCloud()
@@ -1807,8 +1814,9 @@ class SolveViewport(QWidget):
             radius = max_extent * 0.005 * point_scale
             
             for t_id in self.selected_tracks:
-                if t_id < len(self.full_points):
-                    pt = self.full_points[t_id]
+                compact_id = self.track_to_compact.get(t_id)
+                if compact_id is not None and compact_id < len(self.full_points):
+                    pt = self.full_points[compact_id]
                     sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
                     sphere.translate(pt)
                     self.highlight_mesh += sphere
@@ -1821,8 +1829,9 @@ class SolveViewport(QWidget):
                 ctype = self.active_constraint['type']
                 pts = []
                 for t_id in self.selected_tracks:
-                    if t_id < len(self.full_points):
-                        pts.append(self.full_points[t_id])
+                    compact_id = self.track_to_compact.get(t_id)
+                    if compact_id is not None and compact_id < len(self.full_points):
+                        pts.append(self.full_points[compact_id])
                 pts = np.array(pts)
                 
                 if "Line" in ctype and len(pts) == 2:
