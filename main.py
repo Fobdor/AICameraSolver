@@ -176,43 +176,65 @@ class DownloadWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
-class AIDepthWorker(QThread):
+class AIDepthSequenceWorker(QThread):
     progress = Signal(int)
-    finished = Signal(np.ndarray)
+    finished = Signal()
     error = Signal(str)
 
-    def __init__(self, frame_path):
+    def __init__(self, proxies_dir, depth_proxies_dir):
         super().__init__()
-        self.frame_path = frame_path
+        self.proxies_dir = proxies_dir
+        self.depth_proxies_dir = depth_proxies_dir
 
     def run(self):
         try:
-            self.progress.emit(10)
+            self.progress.emit(2)
             from transformers import pipeline
             from PIL import Image
             import torch
+            import cv2
+            import numpy as np
             
-            self.progress.emit(20)
+            self.progress.emit(5)
             model_path = os.path.join(MODELS_DIR, "depth_anything_v2_hf")
             if not os.path.exists(os.path.join(model_path, "model.safetensors")):
                 raise Exception("AI Depth Model not downloaded. Please click 'Download Setup Models' in the Setup tab.")
                 
             pipe = pipeline('depth-estimation', model=model_path, local_files_only=True, device=0 if torch.cuda.is_available() else -1)
             
-            self.progress.emit(50)
-            img = Image.open(self.frame_path).convert('RGB')
-            w, h = img.size
-            result = pipe(img)
+            self.progress.emit(10)
             
-            self.progress.emit(80)
-            depth_tensor = result['predicted_depth']
-            depth_np = depth_tensor.squeeze().cpu().numpy()
+            frame_files = sorted([f for f in os.listdir(self.proxies_dir) if f.endswith('.jpg') or f.endswith('.png')])
+            if not frame_files:
+                raise Exception("No proxy frames found to process.")
+                
+            total = len(frame_files)
             
-            import cv2
-            depth_np = cv2.resize(depth_np, (w, h), interpolation=cv2.INTER_LINEAR)
+            for i, f_name in enumerate(frame_files):
+                in_path = os.path.join(self.proxies_dir, f_name)
+                
+                # Derive output filename (replace extension with .npy)
+                base_name = os.path.splitext(f_name)[0]
+                out_path = os.path.join(self.depth_proxies_dir, f"{base_name}.npy")
+                
+                # Skip if already exists? No, we should probably overwrite to be safe.
+                
+                img = Image.open(in_path).convert('RGB')
+                w, h = img.size
+                res = pipe(img)
+                
+                depth_tensor = res['predicted_depth']
+                depth_np = depth_tensor.squeeze().cpu().numpy()
+                depth_np = cv2.resize(depth_np, (w, h), interpolation=cv2.INTER_LINEAR)
+                
+                np.save(out_path, depth_np)
+                
+                # Progress from 10% to 99%
+                prog = 10 + int((i + 1) / total * 89)
+                self.progress.emit(prog)
             
             self.progress.emit(100)
-            self.finished.emit(depth_np)
+            self.finished.emit()
         except Exception as e:
             self.error.emit(f"AI Depth Error: {str(e)}")
 
@@ -340,6 +362,12 @@ class SequenceViewerWidget(QWidget):
         
         self.lbl_frame = QLabel("Frame: 0/0")
         
+        if self.show_tracks:
+            self.combo_view_mode = QComboBox()
+            self.combo_view_mode.addItems(["RGB", "Depth"])
+            self.combo_view_mode.currentIndexChanged.connect(lambda: self.on_frame_changed(self.slider.value()))
+            ctrl_layout.addWidget(self.combo_view_mode)
+            
         ctrl_layout.addWidget(self.slider)
         ctrl_layout.addWidget(self.lbl_frame)
         layout.addLayout(ctrl_layout)
@@ -549,11 +577,27 @@ class SequenceViewerWidget(QWidget):
             if os.path.exists(mask_path):
                 mask_mtime = os.path.getmtime(mask_path)
             
+        view_mode = "RGB"
+        if hasattr(self, 'combo_view_mode'):
+            view_mode = self.combo_view_mode.currentText()
+            
         base_pixmap = QPixmap()
         if self.project_dir:
-            proxy_path = os.path.join(self.project_dir, 'proxies', f"{index:05d}.jpg")
-            if os.path.exists(proxy_path):
-                base_pixmap = fetch_proxy_qpixmap(proxy_path, mask_path, mask_mtime)
+            if view_mode == "Depth":
+                depth_path = os.path.join(self.project_dir, 'depth_proxies', f"{index:05d}.npy")
+                if os.path.exists(depth_path):
+                    import numpy as np
+                    import cv2
+                    depth = np.load(depth_path)
+                    depth_norm = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                    depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
+                    h, w, c = depth_color.shape
+                    qImg = QImage(depth_color.data, w, h, 3 * w, QImage.Format_BGR888)
+                    base_pixmap = QPixmap.fromImage(qImg)
+            else:
+                proxy_path = os.path.join(self.project_dir, 'proxies', f"{index:05d}.jpg")
+                if os.path.exists(proxy_path):
+                    base_pixmap = fetch_proxy_qpixmap(proxy_path, mask_path, mask_mtime)
                 
         if base_pixmap.isNull():
             base_pixmap = fetch_qpixmap(frame_path, self.color_space, mask_path, mask_mtime)
@@ -1674,7 +1718,7 @@ class SolveViewport(QWidget):
         self.vis.poll_events()
         self.vis.update_renderer()
         
-    def load_solve_data(self, npz_path, camera_setup_data):
+    def load_solve_data(self, npz_path, camera_setup_data, reset_view=True):
         data = np.load(npz_path)
         self.full_points = data['points_3d']
         self.full_errors = data['points_error']
@@ -1697,14 +1741,20 @@ class SolveViewport(QWidget):
         self.full_colors[:, 0] = t # R
         self.full_colors[:, 1] = 1.0 - t # G
         
+        view_ctl = None
+        cam_params = None
+        if not reset_view and self.pcd is not None:
+            view_ctl = self.vis.get_view_control()
+            cam_params = view_ctl.convert_to_pinhole_camera_parameters()
+            
         if self.pcd is not None:
-            self.vis.remove_geometry(self.pcd)
+            self.vis.remove_geometry(self.pcd, reset_bounding_box=reset_view)
         for ls in self.camera_linesets:
-            self.vis.remove_geometry(ls)
+            self.vis.remove_geometry(ls, reset_bounding_box=reset_view)
         self.camera_linesets.clear()
         
         self.pcd = o3d.geometry.PointCloud()
-        self.vis.add_geometry(self.pcd)
+        self.vis.add_geometry(self.pcd, reset_bounding_box=reset_view)
         self.update_error_threshold()
         
         plate_w = camera_setup_data.get('plate_width', 1920)
@@ -1745,7 +1795,7 @@ class SolveViewport(QWidget):
             ls.lines = o3d.utility.Vector2iVector(frustum_lines)
             ls.colors = o3d.utility.Vector3dVector(colors)
             self.camera_linesets.append(ls)
-            self.vis.add_geometry(ls)
+            self.vis.add_geometry(ls, reset_bounding_box=reset_view)
             
         self.slider_frame.setMaximum(max(0, len(self.camera_linesets) - 1))
         self.slider_frame.setValue(0)
@@ -1757,9 +1807,12 @@ class SolveViewport(QWidget):
             path_ls.points = o3d.utility.Vector3dVector(np.array(path_pts))
             path_ls.lines = o3d.utility.Vector2iVector(path_lines)
             path_ls.colors = o3d.utility.Vector3dVector([[1,1,0] for _ in range(len(path_lines))])
-            self.vis.add_geometry(path_ls)
+            self.vis.add_geometry(path_ls, reset_bounding_box=reset_view)
             
-        self.vis.reset_view_point(True)
+        if reset_view:
+            self.vis.reset_view_point(True)
+        elif view_ctl is not None and cam_params is not None:
+            view_ctl.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
         
     def update_active_camera(self):
         if not self.camera_linesets: return
@@ -2036,6 +2089,7 @@ class MainWindow(QMainWindow):
         self.btn_regen_proxies.setEnabled(False)
         ctrl_layout.addWidget(self.btn_regen_proxies)
         
+
         ctrl_layout.addStretch()
         layout.addLayout(ctrl_layout)
         
@@ -2325,10 +2379,35 @@ class MainWindow(QMainWindow):
         self.btn_start_solve.clicked.connect(self.run_solve)
         solve_btn_layout.addWidget(self.btn_start_solve)
         
+        self.btn_gen_depth = QPushButton("Generate Depth Sequence")
+        self.btn_gen_depth.clicked.connect(self.generate_depth_sequence)
+        self.btn_gen_depth.setEnabled(False)
+        solve_btn_layout.addWidget(self.btn_gen_depth)
+        
         self.btn_ai_verify = QPushButton("AI Spatial Smoothing")
-        self.btn_ai_verify.setStyleSheet("background-color: #3b7b94; font-weight: bold; color: white;")
         self.btn_ai_verify.clicked.connect(self.run_ai_depth_verification)
         solve_btn_layout.addWidget(self.btn_ai_verify)
+        
+        self.btn_toggle_view = QPushButton("Preview Raw Data")
+        self.btn_toggle_view.clicked.connect(self.toggle_solve_view)
+        solve_btn_layout.addWidget(self.btn_toggle_view)
+        
+        self.btn_revert_solve = QPushButton("Revert to Raw Solve")
+        self.btn_revert_solve.clicked.connect(self.revert_solve)
+        solve_btn_layout.addWidget(self.btn_revert_solve)
+        
+        self.combo_ai_mode = QComboBox()
+        self.combo_ai_mode.addItems([
+            "Best View (Fast)",
+            "N-Keyframe Average (5 frames)",
+            "Exhaustive Median (All frames - SLOW)"
+        ])
+        self.combo_ai_mode.setToolTip(
+            "Best View: Selects the single best frame for each point based on visibility.\n"
+            "N-Keyframe Average: Samples 5 evenly spaced frames and averages the depth.\n"
+            "Exhaustive Median: Runs AI on every tracked frame and takes the robust median (Very Slow)."
+        )
+        solve_btn_layout.addWidget(self.combo_ai_mode)
         
         self.lbl_ai_blend = QLabel("Smoothing Strength: 50%")
         solve_btn_layout.addWidget(self.lbl_ai_blend)
@@ -2380,6 +2459,38 @@ class MainWindow(QMainWindow):
         
         self.solve_tab.setLayout(self.solve_layout)
 
+    def toggle_solve_view(self):
+        if not hasattr(self, 'project_dir') or not self.project_dir: return
+        data_path = os.path.join(self.project_dir, 'solve_data.npz')
+        
+        if not hasattr(self, 'viewing_raw'):
+            self.viewing_raw = False
+            
+        self.viewing_raw = not self.viewing_raw
+        
+        if self.viewing_raw:
+            oriented_raw_data = self.apply_orientation_constraints(return_data=True)
+            if oriented_raw_data:
+                preview_path = os.path.join(self.project_dir, 'solve_data_preview.npz')
+                np.savez(preview_path, **oriented_raw_data)
+                self.solve_viewport.load_solve_data(preview_path, self.camera_setup_data, reset_view=False)
+            self.btn_toggle_view.setStyleSheet("background-color: #5a3b22; color: white;")
+            self.btn_toggle_view.setText("Viewing: RAW (Un-smoothed)")
+        else:
+            if os.path.exists(data_path):
+                self.solve_viewport.load_solve_data(data_path, self.camera_setup_data, reset_view=False)
+            self.btn_toggle_view.setStyleSheet("")
+            self.btn_toggle_view.setText("Preview Raw Data")
+
+    def revert_solve(self):
+        if not hasattr(self, 'project_dir') or not self.project_dir: return
+        self.viewing_raw = False
+        if hasattr(self, 'btn_toggle_view'):
+            self.btn_toggle_view.setStyleSheet("")
+            self.btn_toggle_view.setText("Preview Raw Data")
+        self.apply_orientation_constraints(reset_view=False)
+        QMessageBox.information(self, "Reverted", "Restored the raw 3D point cloud from the solver.")
+
     def run_ai_depth_verification(self):
         if not hasattr(self, 'project_dir') or not self.project_dir:
             QMessageBox.warning(self, "Error", "No project loaded.")
@@ -2390,144 +2501,183 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "No solve data found. Run VGGSfM first.")
             return
             
+
+            
+        depth_proxies_dir = os.path.join(self.project_dir, 'depth_proxies')
+        if not os.path.exists(depth_proxies_dir) or not os.listdir(depth_proxies_dir):
+            QMessageBox.warning(self, "Missing Depth Sequence", "Please go to the Setup tab and click 'Generate Depth Sequence' first.")
+            return
+            
         data = dict(np.load(data_path))
         
         frames_dir = os.path.join(self.project_dir, "proxies")
-        if not os.path.exists(frames_dir):
-            QMessageBox.warning(self, "Error", "No proxies found.")
-            return
-            
         frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith('.jpg') or f.endswith('.png')])
         if not frame_files:
             return
             
-        frame_path = os.path.join(frames_dir, frame_files[0])
+        mode_idx = self.combo_ai_mode.currentIndex()
+        num_frames = len(frame_files)
+        target_indices = set()
         
-        self.btn_ai_verify.setEnabled(False)
-        self.solve_progress.show()
-        self.solve_progress.setValue(0)
-        self.lbl_solve_status.setText("Initializing AI Depth Smoothing (Downloading weights if first run)...")
+        if mode_idx == 1: # N-Keyframe Average
+            target_indices = set(np.linspace(0, num_frames - 1, min(5, num_frames), dtype=int))
+        elif mode_idx == 2: # Exhaustive Median
+            target_indices = set(range(num_frames))
+        else: # Best View
+            vis = data['visibility']
+            pts_mask = data['points_mask']
+            vis_tri = vis[:, pts_mask] # (S, N_tri)
+            t2d_tri = data['tracks_2d'][:, pts_mask, :]
+            
+            plate_w = self.camera_setup_data.get('plate_width', 1920)
+            plate_h = self.camera_setup_data.get('plate_height', 1080)
+            cx, cy = plate_w / 2.0, plate_h / 2.0
+            
+            for p_idx in range(vis_tri.shape[1]):
+                valid_f = np.where(vis_tri[:, p_idx])[0]
+                if len(valid_f) == 0: continue
+                dists = [((t2d_tri[f, p_idx, 0] - cx)**2 + (t2d_tri[f, p_idx, 1] - cy)**2) for f in valid_f]
+                best_f = valid_f[np.argmin(dists)]
+                target_indices.add(best_f)
+                
+        if not target_indices: target_indices.add(0)
+        target_indices = sorted(list(target_indices))
         
-        self.ai_depth_worker = AIDepthWorker(frame_path)
-        self.ai_depth_worker.progress.connect(self.solve_progress.setValue)
-        self.ai_depth_worker.finished.connect(lambda depth: self.on_ai_depth_finished(depth, data, data_path, frame_files[0]))
-        self.ai_depth_worker.error.connect(self.on_ai_depth_error)
-        self.ai_depth_worker.start()
+        # Load the requested depth maps directly from disk
+        depth_dict = {}
+        for f_idx in target_indices:
+            base_name = os.path.splitext(frame_files[f_idx])[0]
+            npy_path = os.path.join(depth_proxies_dir, f"{base_name}.npy")
+            if os.path.exists(npy_path):
+                depth_dict[f_idx] = np.load(npy_path)
+                
+        if not depth_dict:
+            QMessageBox.warning(self, "Error", "Could not load depth sequence. Please regenerate it.")
+            return
 
-    def on_ai_depth_error(self, err_str):
-        self.btn_ai_verify.setEnabled(True)
-        self.solve_progress.hide()
-        self.lbl_solve_status.setText("AI Error.")
-        QMessageBox.critical(self, "AI Depth Error", err_str)
-
-    def on_ai_depth_finished(self, depth_map, data, data_path, frame_name):
-        self.btn_ai_verify.setEnabled(True)
-        self.solve_progress.hide()
-        self.lbl_solve_status.setText("AI Depth smoothing complete.")
-        
-        # We now have depth_map (numpy array HxW)
-        # We need to map our 3D points to the 2D frame
         try:
             pts_3d = data['points_3d']
             track_2d = data['tracks_2d']
             pts_mask = data['points_mask']
+            vis = data['visibility']
             
-            # Linear Regression to align Depth map to SfM Depth
-            ai_depths = []
-            sfm_depths = []
-            
-            R_cam = data['cameras_rot'][0]
-            T_cam = data['cameras_trans'][0]
-            
-            for i in range(len(pts_3d)):
-                if not pts_mask[i]: continue
-                # track_2d is [Frames, N, 2]
-                # We need the 2D coordinate for frame_name.
-                # Assuming frame_files[0] corresponds to track_2d index 0
-                x, y = track_2d[0, i]
-                if x < 0 or y < 0: continue
-                
-                h, w = depth_map.shape
-                py, px = int(round(y)), int(round(x))
-                if 0 <= px < w and 0 <= py < h:
-                    raw_ai_val = depth_map[py, px]
-                    # Monocular networks usually output disparity (inverse depth). Convert to relative depth.
-                    ai_z = 1.0 / (raw_ai_val + 1e-6)
-                    
-                    # Convert world point to camera space to find true depth
-                    P_cam = R_cam @ pts_3d[i] + T_cam
-                    sfm_z = P_cam[2]
-                    
-                    ai_depths.append(ai_z)
-                    sfm_depths.append(sfm_z)
-                    
-            if not ai_depths:
-                raise Exception("No valid tracks found on frame 0 to align depth.")
-                
-            ai_depths = np.array(ai_depths)
-            sfm_depths = np.array(sfm_depths)
-            
-            # Use robust least squares with Huber/Soft-L1 loss to ignore massive SfM outliers!
-            # We strictly bound 'm' to be positive so the depth map can NEVER be inverted.
             from scipy.optimize import least_squares
-            
-            def depth_residuals(params):
+            def depth_residuals(params, sfm_z, ai_z):
                 m, c = params
-                return sfm_depths - (m * ai_depths + c)
+                return sfm_z - (m * ai_z + c)
+            
+            frame_data = {}
+            for f_idx in target_indices:
+                if f_idx not in depth_dict: continue
+                depth_map = depth_dict[f_idx]
+                h, w = depth_map.shape
                 
-            # Initial guess: simple median ratio for scale, median diff for shift
-            m_guess = np.median(sfm_depths) / (np.median(ai_depths) + 1e-6)
-            c_guess = np.median(sfm_depths) - m_guess * np.median(ai_depths)
-            
-            res = least_squares(
-                depth_residuals, 
-                [m_guess, c_guess], 
-                loss='soft_l1', 
-                f_scale=1.0, 
-                bounds=([1e-6, -np.inf], [np.inf, np.inf])
-            )
-            m, c = res.x
-            
-            # Now blend them!
+                R_cam = data['cameras_rot'][f_idx]
+                T_cam = data['cameras_trans'][f_idx]
+                
+                ai_depths = []
+                sfm_depths = []
+                
+                for i in range(len(pts_3d)):
+                    if not pts_mask[i] or not vis[f_idx, i]: continue
+                    x, y = track_2d[f_idx, i]
+                    if x < 0 or y < 0: continue
+                    
+                    py, px = int(round(y)), int(round(x))
+                    if 0 <= px < w and 0 <= py < h:
+                        raw_ai_val = depth_map[py, px]
+                        ai_z = 1.0 / (raw_ai_val + 1e-6)
+                        
+                        P_cam = R_cam @ pts_3d[i] + T_cam
+                        sfm_z = P_cam[2]
+                        
+                        ai_depths.append(ai_z)
+                        sfm_depths.append(sfm_z)
+                        
+                if len(ai_depths) > 5:
+                    ai_arr = np.array(ai_depths)
+                    sfm_arr = np.array(sfm_depths)
+                    m_g = np.median(sfm_arr) / (np.median(ai_arr) + 1e-6)
+                    c_g = np.median(sfm_arr) - m_g * np.median(ai_arr)
+                    
+                    res = least_squares(
+                        depth_residuals, [m_g, c_g], args=(sfm_arr, ai_arr),
+                        loss='soft_l1', f_scale=1.0, bounds=([1e-6, -np.inf], [np.inf, np.inf])
+                    )
+                    if not res.success or np.isnan(res.x).any():
+                        continue
+                    m, c = res.x
+                    frame_data[f_idx] = {'m': m, 'c': c, 'R': R_cam, 'T': T_cam, 'depth_map': depth_map}
+                    
+            if not frame_data:
+                raise Exception("No valid tracks found to align depth in any target frame.")
+                
             blend_factor = self.ai_blend_slider.value() / 100.0
+            plate_w = self.camera_setup_data.get('plate_width', 1920)
+            plate_h = self.camera_setup_data.get('plate_height', 1080)
+            cx, cy = plate_w / 2.0, plate_h / 2.0
             
             for i in range(len(pts_3d)):
                 if not pts_mask[i]: continue
-                x, y = track_2d[0, i]
-                if x < 0 or y < 0: continue
                 
-                h, w = depth_map.shape
-                py, px = int(round(y)), int(round(x))
-                if 0 <= px < w and 0 <= py < h:
-                    raw_ai_val = depth_map[py, px]
-                    ai_z = 1.0 / (raw_ai_val + 1e-6)
-                    target_z = m * ai_z + c
+                valid_f = [f for f in target_indices if vis[f, i] and f in frame_data]
+                if not valid_f: continue
+                
+                world_candidates = []
+                dists_to_center = []
+                
+                for f_idx in valid_f:
+                    fdata = frame_data[f_idx]
+                    x, y = track_2d[f_idx, i]
+                    py, px = int(round(y)), int(round(x))
                     
-                    P_cam = R_cam @ pts_3d[i] + T_cam
-                    current_z = P_cam[2]
-                    new_z = (current_z * (1.0 - blend_factor)) + (target_z * blend_factor)
-                    
-                    # Scale the entire camera ray to preserve 2D projection
-                    if current_z > 1e-6:
-                        scale = new_z / current_z
-                        P_cam_new = P_cam * scale
-                    else:
-                        P_cam_new = P_cam.copy()
-                        P_cam_new[2] = new_z
+                    h, w = fdata['depth_map'].shape
+                    if 0 <= px < w and 0 <= py < h:
+                        raw_ai_val = fdata['depth_map'][py, px]
+                        ai_z = 1.0 / (raw_ai_val + 1e-6)
+                        target_z = fdata['m'] * ai_z + fdata['c']
                         
-                    # Transform back to world space
-                    pts_3d[i] = R_cam.T @ (P_cam_new - T_cam)
+                        P_cam = fdata['R'] @ pts_3d[i] + fdata['T']
+                        current_z = P_cam[2]
+                        new_z = (current_z * (1.0 - blend_factor)) + (target_z * blend_factor)
+                        
+                        if current_z > 1e-6:
+                            P_cam_new = P_cam * (new_z / current_z)
+                        else:
+                            P_cam_new = P_cam.copy()
+                            P_cam_new[2] = new_z
+                            
+                        P_world_new = fdata['R'].T @ (P_cam_new - fdata['T'])
+                        
+                        if np.isnan(P_world_new).any(): continue
+                        
+                        world_candidates.append(P_world_new)
+                        dists_to_center.append(math.hypot(x - cx, y - cy))
+                        
+                if not world_candidates: continue
+                
+                cand_arr = np.array(world_candidates)
+                if mode_idx == 0: # Best View
+                    best_idx = np.argmin(dists_to_center)
+                    pts_3d[i] = cand_arr[best_idx]
+                elif mode_idx == 1: # N-Keyframe Average
+                    pts_3d[i] = np.mean(cand_arr, axis=0)
+                else: # Exhaustive Median
+                    pts_3d[i] = np.median(cand_arr, axis=0)
                     
             data['points_3d'] = pts_3d
             np.savez(data_path, **data)
             
-            # Save raw as well so the orientation solver doesn't wipe our smoothing out!
-            raw_data_path = os.path.join(self.project_dir, 'solve_data_raw.npz')
-            np.savez(raw_data_path, **data)
-            
-            self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
+            self.solve_viewport.load_solve_data(data_path, self.camera_setup_data, reset_view=False)
             self.load_2d_solve_data(data_path)
-            QMessageBox.information(self, "AI Verification", "Point cloud spatially smoothed using AI depth priors!")
+            
+            self.viewing_raw = False
+            if hasattr(self, 'btn_toggle_view'):
+                self.btn_toggle_view.setStyleSheet("")
+                self.btn_toggle_view.setText("Preview Raw Data")
+                
+            QMessageBox.information(self, "AI Smoothing", "Point cloud spatially smoothed using AI depth priors!")
+            
             
         except Exception as e:
             QMessageBox.critical(self, "Alignment Error", str(e))
@@ -2688,7 +2838,7 @@ class MainWindow(QMainWindow):
         self.active_constraint = c
         self.update_selection_ui()
 
-    def apply_orientation_constraints(self):
+    def apply_orientation_constraints(self, reset_view=True, return_data=False):
         if not hasattr(self, 'project_dir') or not self.project_dir: return
         
         data_path = os.path.join(self.project_dir, 'solve_data.npz')
@@ -2704,9 +2854,10 @@ class MainWindow(QMainWindow):
         pts_3d = data['points_3d'].copy()
         
         if not self.orientation_constraints:
+            if return_data: return data
             # If no constraints, just restore raw
             np.savez(data_path, **data)
-            self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
+            self.solve_viewport.load_solve_data(data_path, self.camera_setup_data, reset_view=reset_view)
             self.load_2d_solve_data(data_path)
             self.solve_viewport.update_error_threshold()
             return
@@ -2831,8 +2982,11 @@ class MainWindow(QMainWindow):
             data['cameras_rot'][i] = R_cam_new
             data['cameras_trans'][i] = T_cam_new
             
+        if return_data:
+            return data
+            
         np.savez(data_path, **data)
-        self.solve_viewport.load_solve_data(data_path, self.camera_setup_data)
+        self.solve_viewport.load_solve_data(data_path, self.camera_setup_data, reset_view=reset_view)
         self.load_2d_solve_data(data_path)
         self.solve_viewport.update_error_threshold()
 
@@ -2896,6 +3050,7 @@ class MainWindow(QMainWindow):
         os.makedirs(self.undistorted_source_dir, exist_ok=True)
         os.makedirs(os.path.join(self.project_dir, 'masks'), exist_ok=True)
         os.makedirs(os.path.join(self.project_dir, 'proxies'), exist_ok=True)
+        os.makedirs(os.path.join(self.project_dir, 'depth_proxies'), exist_ok=True)
         os.makedirs(os.path.join(self.project_dir, 'exports'), exist_ok=True)
         os.makedirs(os.path.join(self.project_dir, 'user_masks'), exist_ok=True)
         os.makedirs(os.path.join(self.project_root, 'user_masks_source'), exist_ok=True)
@@ -2932,6 +3087,7 @@ class MainWindow(QMainWindow):
             self.project_root = os.path.dirname(file_path)
             self.undistorted_source_dir = os.path.join(self.project_root, "undistorted_source")
             self.project_dir = os.path.join(self.project_root, "source_AICameraSolver_Data")
+            os.makedirs(os.path.join(self.project_dir, 'depth_proxies'), exist_ok=True)
             
             self.exr_files = data.get("exr_files", [])
             self.color_space = data.get("color_space", CS_LINEAR_SRGB)
@@ -2962,6 +3118,7 @@ class MainWindow(QMainWindow):
                 
             self.btn_import_exr.setEnabled(True)
             self.btn_regen_proxies.setEnabled(True)
+            self.btn_gen_depth.setEnabled(True)
             self.lbl_file.setText(f"Project: {self.project_root} | Frames: {len(self.exr_files)}")
             
             if hasattr(self, 'solve_viewport'):
@@ -3040,6 +3197,7 @@ class MainWindow(QMainWindow):
                 
                 self.btn_import_exr.setEnabled(False)
                 self.btn_regen_proxies.setEnabled(False)
+                self.btn_gen_depth.setEnabled(False)
                 self.lbl_file.setText("Generating Proxies... Please wait.")
                 
                 self.proxy_worker = ProxyGeneratorWorker(self.exr_files, self.project_dir, self.color_space, self.proxy_res)
@@ -3060,6 +3218,7 @@ class MainWindow(QMainWindow):
         
         self.btn_import_exr.setEnabled(True)
         self.btn_regen_proxies.setEnabled(True)
+        self.btn_gen_depth.setEnabled(True)
         self.lbl_file.setText(f"Project: {self.project_root} | Frames: {len(self.exr_files)}")
         
         cs = self.color_space
@@ -3074,6 +3233,7 @@ class MainWindow(QMainWindow):
         self.btn_import_exr.setEnabled(True)
         if hasattr(self, 'exr_files') and self.exr_files:
             self.btn_regen_proxies.setEnabled(True)
+            self.btn_gen_depth.setEnabled(True)
         self.lbl_file.setText("Proxy generation failed.")
         QMessageBox.critical(self, "Error", f"Failed to generate proxies: {err_str}")
 
@@ -3091,6 +3251,7 @@ class MainWindow(QMainWindow):
         
         self.btn_import_exr.setEnabled(False)
         self.btn_regen_proxies.setEnabled(False)
+        self.btn_gen_depth.setEnabled(False)
         self.lbl_file.setText("Regenerating Proxies... Please wait.")
         
         self.proxy_worker = ProxyGeneratorWorker(self.exr_files, self.project_dir, self.color_space, self.proxy_res)
@@ -3098,6 +3259,50 @@ class MainWindow(QMainWindow):
         self.proxy_worker.finished.connect(self.on_proxy_finished)
         self.proxy_worker.error.connect(self.on_proxy_error)
         self.proxy_worker.start()
+
+    def generate_depth_sequence(self):
+        if not self.exr_files or not self.project_dir:
+            return
+            
+        proxies_dir = os.path.join(self.project_dir, 'proxies')
+        depth_proxies_dir = os.path.join(self.project_dir, 'depth_proxies')
+        
+        if not os.path.exists(proxies_dir) or not os.listdir(proxies_dir):
+            QMessageBox.warning(self, "Warning", "Please generate image proxies first.")
+            return
+            
+        os.makedirs(depth_proxies_dir, exist_ok=True)
+        
+        self.btn_import_exr.setEnabled(False)
+        self.btn_regen_proxies.setEnabled(False)
+        self.btn_gen_depth.setEnabled(False)
+        self.lbl_file.setText("Generating Depth Sequence... Please wait. This may take a while.")
+        
+        self.setup_viewer.loading_overlay.setText("Generating AI Depth Sequence...\nPlease wait.")
+        self.setup_viewer.loading_overlay.resize(self.setup_viewer.view.size())
+        self.setup_viewer.loading_overlay.show()
+        
+        self.ai_depth_seq_worker = AIDepthSequenceWorker(proxies_dir, depth_proxies_dir)
+        self.ai_depth_seq_worker.progress.connect(self.on_proxy_progress)
+        self.ai_depth_seq_worker.finished.connect(self.on_depth_seq_finished)
+        self.ai_depth_seq_worker.error.connect(self.on_depth_seq_error)
+        self.ai_depth_seq_worker.start()
+
+    def on_depth_seq_finished(self):
+        self.setup_viewer.loading_overlay.hide()
+        self.btn_import_exr.setEnabled(True)
+        self.btn_regen_proxies.setEnabled(True)
+        self.btn_gen_depth.setEnabled(True)
+        self.lbl_file.setText(f"Project: {self.project_root} | Depth Sequence Generated.")
+        QMessageBox.information(self, "Success", "Depth sequence generated successfully!")
+
+    def on_depth_seq_error(self, err_str):
+        self.setup_viewer.loading_overlay.hide()
+        self.btn_import_exr.setEnabled(True)
+        self.btn_regen_proxies.setEnabled(True)
+        self.btn_gen_depth.setEnabled(True)
+        self.lbl_file.setText("Depth generation failed.")
+        QMessageBox.critical(self, "Error", f"Failed to generate depth sequence: {err_str}")
 
     def run_tracking(self):
         import os
