@@ -1663,7 +1663,15 @@ class SolveViewport(QWidget):
         plate_w = camera_setup_data.get('plate_width', 1920)
         plate_h = camera_setup_data.get('plate_height', 1080)
         cx, cy = plate_w / 2.0, plate_h / 2.0
-        z = self.slider_cam_scale.value() / 10.0
+        
+        if len(self.full_points) > 0:
+            min_bound = np.min(self.full_points, axis=0)
+            max_bound = np.max(self.full_points, axis=0)
+            max_extent = np.max(max_bound - min_bound)
+        else:
+            max_extent = 10.0
+            
+        z = max_extent * 0.01 * (self.slider_cam_scale.value() / 10.0)
         x_max = (plate_w - cx) / self.focal_px * z
         x_min = (0 - cx) / self.focal_px * z
         y_max = (plate_h - cy) / self.focal_px * z
@@ -1745,8 +1753,17 @@ class SolveViewport(QWidget):
         self.highlight_mesh = o3d.geometry.TriangleMesh()
         
         if hasattr(self, 'selected_tracks') and self.selected_tracks:
+            # Calculate dynamic bounding box extent so the sizes scale with any scene size
+            if len(self.full_points) > 0:
+                min_bound = np.min(self.full_points, axis=0)
+                max_bound = np.max(self.full_points, axis=0)
+                max_extent = np.max(max_bound - min_bound)
+            else:
+                max_extent = 10.0
+                
             point_scale = self.slider_point_scale.value() / 10.0 if hasattr(self, 'slider_point_scale') else 9.0
-            radius = 0.05 * point_scale
+            radius = max_extent * 0.005 * point_scale
+            
             for t_id in self.selected_tracks:
                 if t_id < len(self.full_points):
                     pt = self.full_points[t_id]
@@ -1794,7 +1811,7 @@ class SolveViewport(QWidget):
                     normal = normal / np.linalg.norm(normal)
                     
                     cam_scale = self.slider_cam_scale.value() / 10.0 if hasattr(self, 'slider_cam_scale') else 1.0
-                    plane_size = 5.0 * cam_scale
+                    plane_size = max_extent * 0.5 * cam_scale
                     box = o3d.geometry.TriangleMesh.create_box(width=plane_size, height=plane_size, depth=radius*0.2)
                     box.translate([-plane_size/2, -plane_size/2, 0])
                     
@@ -1824,7 +1841,15 @@ class SolveViewport(QWidget):
         plate_w = self.camera_setup_data.get('plate_width', 1920)
         plate_h = self.camera_setup_data.get('plate_height', 1080)
         cx, cy = plate_w / 2.0, plate_h / 2.0
-        z = self.slider_cam_scale.value() / 10.0
+        
+        if hasattr(self, 'full_points') and len(self.full_points) > 0:
+            min_bound = np.min(self.full_points, axis=0)
+            max_bound = np.max(self.full_points, axis=0)
+            max_extent = np.max(max_bound - min_bound)
+        else:
+            max_extent = 10.0
+            
+        z = max_extent * 0.01 * (self.slider_cam_scale.value() / 10.0)
         
         x_max = (plate_w - cx) / self.focal_px * z
         x_min = (0 - cx) / self.focal_px * z
@@ -2287,9 +2312,9 @@ class MainWindow(QMainWindow):
             
         data = dict(np.load(data_path))
         
-        frames_dir = os.path.join(self.project_dir, "frames")
+        frames_dir = os.path.join(self.project_dir, "proxies")
         if not os.path.exists(frames_dir):
-            QMessageBox.warning(self, "Error", "No frames found.")
+            QMessageBox.warning(self, "Error", "No proxies found.")
             return
             
         frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith('.jpg') or f.endswith('.png')])
