@@ -1572,7 +1572,7 @@ class SolveViewport(QWidget):
         point_scale_layout.addWidget(QLabel("Highlight Size:"))
         self.slider_point_scale = QSlider(Qt.Horizontal)
         self.slider_point_scale.setRange(1, 200)
-        self.slider_point_scale.setValue(30)
+        self.slider_point_scale.setValue(90) # Match original 9.0 scale
         self.slider_point_scale.valueChanged.connect(self.update_error_threshold)
         point_scale_layout.addWidget(self.slider_point_scale)
         self.control_layout.addLayout(point_scale_layout)
@@ -1739,11 +1739,10 @@ class SolveViewport(QWidget):
         self.lbl_error.setText(f"Max Reprojection Error: {threshold:.1f}px")
         
         # Build giant physical spheres for selected points so they are obvious
-        self.vis.remove_geometry(self.highlight_mesh, reset_bounding_box=False)
-        self.highlight_mesh = o3d.geometry.TriangleMesh()
+        self.highlight_mesh.clear()
         
         if hasattr(self, 'selected_tracks') and self.selected_tracks:
-            point_scale = self.slider_point_scale.value() / 10.0 if hasattr(self, 'slider_point_scale') else 3.0
+            point_scale = self.slider_point_scale.value() / 10.0 if hasattr(self, 'slider_point_scale') else 9.0
             radius = 0.05 * point_scale
             for t_id in self.selected_tracks:
                 if t_id < len(self.full_points):
@@ -1753,7 +1752,7 @@ class SolveViewport(QWidget):
                     self.highlight_mesh += sphere
                     
             self.highlight_mesh.compute_vertex_normals()
-            self.highlight_mesh.paint_uniform_color([1.0, 1.0, 0.0]) # Bright Yellow
+            self.highlight_mesh.paint_uniform_color([1.0, 0.0, 0.0]) # Red for spheres so they stand out against planes
             
             # Draw lines or planes based on constraint
             if hasattr(self, 'active_constraint') and self.active_constraint:
@@ -1791,6 +1790,7 @@ class SolveViewport(QWidget):
                     normal = vh[-1, :]
                     normal = normal / np.linalg.norm(normal)
                     
+                    cam_scale = self.slider_cam_scale.value() / 10.0 if hasattr(self, 'slider_cam_scale') else 1.0
                     plane_size = 5.0 * cam_scale
                     box = o3d.geometry.TriangleMesh.create_box(width=plane_size, height=plane_size, depth=radius*0.2)
                     box.translate([-plane_size/2, -plane_size/2, 0])
@@ -1809,11 +1809,11 @@ class SolveViewport(QWidget):
                     box.rotate(R, center=[0,0,0])
                     box.translate(centroid)
                     box.compute_vertex_normals()
-                    box.paint_uniform_color([1.0, 1.0, 0.0])
-                    # blend it as a semi-transparent yellow? Open3D legacy doesn't do transparency easily on a per-mesh basis, so we just use wireframe or solid.
+                    box.paint_uniform_color([1.0, 1.0, 0.0]) # Yellow plane
                     self.highlight_mesh += box
             
-        self.vis.add_geometry(self.highlight_mesh, reset_bounding_box=False)
+        # Efficient geometry update
+        self.vis.update_geometry(self.highlight_mesh)
 
     def update_camera_scale(self):
         if not hasattr(self, 'cameras_rot') or not hasattr(self, 'focal_px'): return
