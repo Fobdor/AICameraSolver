@@ -2373,28 +2373,25 @@ class MainWindow(QMainWindow):
 
     def init_solve_tab(self):
         self.solve_layout = QVBoxLayout()
-        solve_btn_layout = QHBoxLayout()
+        top_ctrl_layout = QHBoxLayout()
         
+        # 1. Base Structure Group
+        group_base = QGroupBox("1. Base Structure")
+        layout_base = QVBoxLayout()
         self.btn_start_solve = QPushButton("Start 3D Solver (VGGSfM)")
+        self.btn_start_solve.setMinimumHeight(40)
         self.btn_start_solve.clicked.connect(self.run_solve)
-        solve_btn_layout.addWidget(self.btn_start_solve)
+        layout_base.addWidget(self.btn_start_solve)
+        layout_base.addStretch()
+        group_base.setLayout(layout_base)
+        
+        # 2. AI Spatial Refinement Group
+        group_ai = QGroupBox("2. AI Spatial Refinement")
+        layout_ai = QGridLayout()
         
         self.btn_gen_depth = QPushButton("Generate Depth Sequence")
         self.btn_gen_depth.clicked.connect(self.generate_depth_sequence)
         self.btn_gen_depth.setEnabled(False)
-        solve_btn_layout.addWidget(self.btn_gen_depth)
-        
-        self.btn_ai_verify = QPushButton("AI Spatial Smoothing")
-        self.btn_ai_verify.clicked.connect(self.run_ai_depth_verification)
-        solve_btn_layout.addWidget(self.btn_ai_verify)
-        
-        self.btn_toggle_view = QPushButton("Preview Raw Data")
-        self.btn_toggle_view.clicked.connect(self.toggle_solve_view)
-        solve_btn_layout.addWidget(self.btn_toggle_view)
-        
-        self.btn_revert_solve = QPushButton("Revert to Raw Solve")
-        self.btn_revert_solve.clicked.connect(self.revert_solve)
-        solve_btn_layout.addWidget(self.btn_revert_solve)
         
         self.combo_ai_mode = QComboBox()
         self.combo_ai_mode.addItems([
@@ -2407,19 +2404,46 @@ class MainWindow(QMainWindow):
             "N-Keyframe Average: Samples 5 evenly spaced frames and averages the depth.\n"
             "Exhaustive Median: Runs AI on every tracked frame and takes the robust median (Very Slow)."
         )
-        solve_btn_layout.addWidget(self.combo_ai_mode)
         
-        self.lbl_ai_blend = QLabel("Smoothing Strength: 50%")
-        solve_btn_layout.addWidget(self.lbl_ai_blend)
-        
+        self.lbl_ai_blend = QLabel("Strength: 50%")
         self.ai_blend_slider = QSlider(Qt.Horizontal)
         self.ai_blend_slider.setRange(0, 100)
         self.ai_blend_slider.setValue(50)
         self.ai_blend_slider.setFixedWidth(100)
-        self.ai_blend_slider.valueChanged.connect(lambda v: self.lbl_ai_blend.setText(f"Smoothing Strength: {v}%"))
-        solve_btn_layout.addWidget(self.ai_blend_slider)
+        self.ai_blend_slider.valueChanged.connect(lambda v: self.lbl_ai_blend.setText(f"Strength: {v}%"))
         
-        self.solve_layout.addLayout(solve_btn_layout)
+        self.btn_ai_verify = QPushButton("AI Spatial Smoothing")
+        self.btn_ai_verify.clicked.connect(self.run_ai_depth_verification)
+        self.btn_ai_verify.setMinimumHeight(35)
+        
+        layout_ai.addWidget(self.btn_gen_depth, 0, 0, 1, 2)
+        layout_ai.addWidget(QLabel("Mode:"), 1, 0)
+        layout_ai.addWidget(self.combo_ai_mode, 1, 1)
+        layout_ai.addWidget(self.lbl_ai_blend, 2, 0)
+        layout_ai.addWidget(self.ai_blend_slider, 2, 1)
+        layout_ai.addWidget(self.btn_ai_verify, 3, 0, 1, 2)
+        group_ai.setLayout(layout_ai)
+        
+        # 3. Data Management Group
+        group_data = QGroupBox("3. Data Management")
+        layout_data = QVBoxLayout()
+        
+        self.btn_toggle_view = QPushButton("Preview Raw Data")
+        self.btn_toggle_view.clicked.connect(self.toggle_solve_view)
+        
+        self.btn_revert_solve = QPushButton("Revert to Raw Solve")
+        self.btn_revert_solve.clicked.connect(self.revert_solve)
+        
+        layout_data.addWidget(self.btn_toggle_view)
+        layout_data.addWidget(self.btn_revert_solve)
+        layout_data.addStretch()
+        group_data.setLayout(layout_data)
+        
+        top_ctrl_layout.addWidget(group_base)
+        top_ctrl_layout.addWidget(group_ai)
+        top_ctrl_layout.addWidget(group_data)
+        
+        self.solve_layout.addLayout(top_ctrl_layout)
         
         self.lbl_solve_status = QLabel("")
         self.solve_layout.addWidget(self.lbl_solve_status)
