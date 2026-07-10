@@ -1733,14 +1733,16 @@ class SolveViewport(QWidget):
                 if len(idx_in_valid) > 0:
                     cols[idx_in_valid[0]] = [1.0, 1.0, 0.0] # Yellow
                     
+        self.vis.remove_geometry(self.pcd, reset_bounding_box=False)
+        self.pcd = o3d.geometry.PointCloud()
         self.pcd.points = o3d.utility.Vector3dVector(pts)
         self.pcd.colors = o3d.utility.Vector3dVector(cols)
-        self.vis.update_geometry(self.pcd)
+        self.vis.add_geometry(self.pcd, reset_bounding_box=False)
         self.lbl_error.setText(f"Max Reprojection Error: {threshold:.1f}px")
         
         # Build giant physical spheres for selected points so they are obvious
         self.vis.remove_geometry(self.highlight_mesh, reset_bounding_box=False)
-        self.highlight_mesh.clear()
+        self.highlight_mesh = o3d.geometry.TriangleMesh()
         
         if hasattr(self, 'selected_tracks') and self.selected_tracks:
             point_scale = self.slider_point_scale.value() / 10.0 if hasattr(self, 'slider_point_scale') else 9.0
