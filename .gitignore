@@ -52,7 +52,6 @@ temp_vggsfm_repo/
 1/
 CHECK.txt
 pairs.txt
-cameras.json
 
 # Test scripts
 test_*.py
