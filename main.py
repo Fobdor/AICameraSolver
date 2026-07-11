@@ -2124,6 +2124,8 @@ class ProxyGeoViewport(QWidget):
             self.vis.add_geometry(self.mesh)
             self.vis.poll_events()
             self.vis.update_renderer()
+            return len(self.mesh.triangles)
+        return 0
 
 class TSDFWorker(QThread):
     progress = Signal(int)
@@ -2394,12 +2396,8 @@ class TSDFWorker(QThread):
                 mesh_verts[vert_indices[snap_mask]] = valid_sfm_points[snap_mask]
                 mesh.vertices = o3d.utility.Vector3dVector(mesh_verts)
             
-            self.progress.emit(85)
-            self.status.emit("Smoothing mesh...")
-            
-            # Taubin smoothing: removes noise/spikes while preserving volume
-            # (unlike Laplacian which shrinks the mesh)
-            mesh = mesh.filter_smooth_taubin(number_of_iterations=10)
+            self.progress.emit(90)
+            self.status.emit("Computing normals...")
             mesh.compute_vertex_normals()
             
             self.status.emit("Saving raw geometry...")
@@ -2430,17 +2428,13 @@ class DecimateWorker(QThread):
         try:
             import open3d as o3d
             
-            self.status.emit("Loading raw mesh...")
+            self.status.emit("Loading current mesh...")
             self.progress.emit(10)
             
-            raw_path = os.path.join(self.project_dir, 'proxy_geo_raw.obj')
-            if not os.path.exists(raw_path):
-                # Fall back to current proxy_geo if raw doesn't exist
-                raw_path = os.path.join(self.project_dir, 'proxy_geo.obj')
-                if not os.path.exists(raw_path):
-                    raise Exception("No proxy geometry found to decimate.")
-                    
-            mesh = o3d.io.read_triangle_mesh(raw_path)
+            current_path = os.path.join(self.project_dir, 'proxy_geo.obj')
+            if not os.path.exists(current_path):
+                raise Exception("No proxy geometry found to decimate. Generate it first.")
+            mesh = o3d.io.read_triangle_mesh(current_path)
             
             if len(mesh.triangles) <= self.target_tris:
                 self.status.emit("Mesh already at or below target triangles.")
@@ -2460,6 +2454,49 @@ class DecimateWorker(QThread):
             self.status.emit("Saving mesh...")
             out_path = os.path.join(self.project_dir, 'proxy_geo.obj')
             o3d.io.write_triangle_mesh(out_path, mesh)
+            
+            self.progress.emit(100)
+            self.finished.emit()
+            
+        except Exception as e:
+            import traceback
+            self.error.emit(str(e) + "\n" + traceback.format_exc())
+
+class SmoothWorker(QThread):
+    progress = Signal(int)
+    status = Signal(str)
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, project_dir, iters):
+        super().__init__()
+        self.project_dir = project_dir
+        self.iters = iters
+
+    def run(self):
+        try:
+            import open3d as o3d
+            
+            self.status.emit("Loading current mesh...")
+            self.progress.emit(10)
+            
+            current_path = os.path.join(self.project_dir, 'proxy_geo.obj')
+            if not os.path.exists(current_path):
+                raise Exception("No proxy geometry found to smooth. Generate it first.")
+                    
+            mesh = o3d.io.read_triangle_mesh(current_path)
+                
+            self.status.emit("Smoothing mesh...")
+            self.progress.emit(30)
+            
+            mesh = mesh.filter_smooth_taubin(number_of_iterations=self.iters)
+            
+            self.progress.emit(80)
+            self.status.emit("Computing normals...")
+            mesh.compute_vertex_normals()
+            
+            self.status.emit("Saving mesh...")
+            o3d.io.write_triangle_mesh(current_path, mesh)
             
             self.progress.emit(100)
             self.finished.emit()
@@ -2993,10 +3030,18 @@ class MainWindow(QMainWindow):
         self.btn_revert_proxy_geo.setMinimumHeight(40)
         self.btn_revert_proxy_geo.clicked.connect(self.revert_proxy_geo)
         
+        self.btn_smooth_proxy_geo = QPushButton("Smooth Mesh")
+        self.btn_smooth_proxy_geo.setMinimumHeight(40)
+        self.btn_smooth_proxy_geo.clicked.connect(self.run_smooth_worker)
+        
         self.spin_target_tris = QSpinBox()
         self.spin_target_tris.setRange(1000, 1000000)
         self.spin_target_tris.setValue(50000)
         self.spin_target_tris.setSingleStep(5000)
+        
+        self.spin_smooth_iters = QSpinBox()
+        self.spin_smooth_iters.setRange(1, 100)
+        self.spin_smooth_iters.setValue(10)
         
         self.spin_subsample = QSpinBox()
         self.spin_subsample.setRange(1, 100)
@@ -3005,16 +3050,25 @@ class MainWindow(QMainWindow):
         
         ctrl_layout.addWidget(QLabel("Target Triangles:"))
         ctrl_layout.addWidget(self.spin_target_tris)
+        ctrl_layout.addWidget(self.btn_decimate_proxy_geo)
+        
+        ctrl_layout.addWidget(QLabel("Smooth Iters:"))
+        ctrl_layout.addWidget(self.spin_smooth_iters)
+        ctrl_layout.addWidget(self.btn_smooth_proxy_geo)
+        
         ctrl_layout.addWidget(QLabel("Subsample Step:"))
         ctrl_layout.addWidget(self.spin_subsample)
         ctrl_layout.addWidget(self.btn_gen_proxy_geo)
-        ctrl_layout.addWidget(self.btn_decimate_proxy_geo)
         ctrl_layout.addWidget(self.btn_revert_proxy_geo)
         
         layout.addLayout(ctrl_layout)
         
         self.lbl_proxy_geo_status = QLabel("")
         layout.addWidget(self.lbl_proxy_geo_status)
+        
+        self.lbl_tri_count = QLabel("Triangles: 0")
+        self.lbl_tri_count.setStyleSheet("font-weight: bold; color: #a0a0a0;")
+        layout.addWidget(self.lbl_tri_count)
         
         self.proxy_geo_progress = QProgressBar()
         self.proxy_geo_progress.setValue(0)
@@ -3057,17 +3111,22 @@ class MainWindow(QMainWindow):
         self.tsdf_worker.error.connect(self.on_tsdf_error)
         self.tsdf_worker.start()
         
+    def update_tri_count(self, count):
+        self.lbl_tri_count.setText(f"Triangles: {count:,}")
+
     def on_tsdf_finished(self):
         self.lbl_proxy_geo_status.setText("Raw Proxy Geometry Generated!")
         self.btn_gen_proxy_geo.setEnabled(True)
         mesh_path = os.path.join(self.project_dir, 'proxy_geo_raw.obj')
-        self.proxy_geo_3d_viewport.load_proxy_mesh(mesh_path)
+        count = self.proxy_geo_3d_viewport.load_proxy_mesh(mesh_path)
+        self.update_tri_count(count)
         
     def on_tsdf_error(self, err):
         self.lbl_proxy_geo_status.setText("Error generating geometry.")
         self.btn_gen_proxy_geo.setEnabled(True)
         if hasattr(self, 'btn_decimate_proxy_geo'):
             self.btn_decimate_proxy_geo.setEnabled(True)
+            self.btn_smooth_proxy_geo.setEnabled(True)
             self.btn_revert_proxy_geo.setEnabled(True)
         QMessageBox.critical(self, "Geometry Error", err)
         
@@ -3077,6 +3136,7 @@ class MainWindow(QMainWindow):
             return
             
         self.btn_decimate_proxy_geo.setEnabled(False)
+        self.btn_smooth_proxy_geo.setEnabled(False)
         self.btn_gen_proxy_geo.setEnabled(False)
         self.btn_revert_proxy_geo.setEnabled(False)
         self.proxy_geo_progress.setValue(0)
@@ -3095,10 +3155,44 @@ class MainWindow(QMainWindow):
     def on_decimate_finished(self):
         self.lbl_proxy_geo_status.setText("Mesh Decimated!")
         self.btn_decimate_proxy_geo.setEnabled(True)
+        self.btn_smooth_proxy_geo.setEnabled(True)
         self.btn_gen_proxy_geo.setEnabled(True)
         self.btn_revert_proxy_geo.setEnabled(True)
         mesh_path = os.path.join(self.project_dir, 'proxy_geo.obj')
-        self.proxy_geo_3d_viewport.load_proxy_mesh(mesh_path)
+        count = self.proxy_geo_3d_viewport.load_proxy_mesh(mesh_path)
+        self.update_tri_count(count)
+        
+    def run_smooth_worker(self):
+        if not self.project_dir:
+            QMessageBox.warning(self, "Error", "No project loaded.")
+            return
+            
+        self.btn_decimate_proxy_geo.setEnabled(False)
+        self.btn_smooth_proxy_geo.setEnabled(False)
+        self.btn_gen_proxy_geo.setEnabled(False)
+        self.btn_revert_proxy_geo.setEnabled(False)
+        self.proxy_geo_progress.setValue(0)
+        self.proxy_geo_progress.show()
+        
+        self.smooth_worker = SmoothWorker(
+            self.project_dir, 
+            self.spin_smooth_iters.value()
+        )
+        self.smooth_worker.progress.connect(self.proxy_geo_progress.setValue)
+        self.smooth_worker.status.connect(self.lbl_proxy_geo_status.setText)
+        self.smooth_worker.finished.connect(self.on_smooth_finished)
+        self.smooth_worker.error.connect(self.on_tsdf_error)
+        self.smooth_worker.start()
+
+    def on_smooth_finished(self):
+        self.lbl_proxy_geo_status.setText("Mesh Smoothed!")
+        self.btn_decimate_proxy_geo.setEnabled(True)
+        self.btn_smooth_proxy_geo.setEnabled(True)
+        self.btn_gen_proxy_geo.setEnabled(True)
+        self.btn_revert_proxy_geo.setEnabled(True)
+        mesh_path = os.path.join(self.project_dir, 'proxy_geo.obj')
+        count = self.proxy_geo_3d_viewport.load_proxy_mesh(mesh_path)
+        self.update_tri_count(count)
         
     def revert_proxy_geo(self):
         if not self.project_dir: return
@@ -3109,7 +3203,8 @@ class MainWindow(QMainWindow):
         import shutil
         out_path = os.path.join(self.project_dir, 'proxy_geo.obj')
         shutil.copy(raw_path, out_path)
-        self.proxy_geo_3d_viewport.load_proxy_mesh(out_path)
+        count = self.proxy_geo_3d_viewport.load_proxy_mesh(out_path)
+        self.update_tri_count(count)
         self.lbl_proxy_geo_status.setText("Reverted to raw mesh.")
 
     def toggle_solve_view(self):
