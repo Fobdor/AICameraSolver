@@ -1979,6 +1979,446 @@ class SolveViewport(QWidget):
             
         self.update_error_threshold()
             
+class ProxyGeoViewport(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.vis = o3d.visualization.Visualizer()
+        self.vis.create_window("O3D_ProxyGeo", width=800, height=600, visible=False)
+        opt = self.vis.get_render_option()
+        opt.background_color = np.asarray([0, 0, 0])
+        opt.point_size = 2.0
+        
+        for _ in range(10):
+            self.vis.poll_events()
+            self.vis.update_renderer()
+            time.sleep(0.01)
+            
+        hwnd = win32gui.FindWindow(None, "O3D_ProxyGeo")
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        
+        if hwnd:
+            window = QWindow.fromWinId(hwnd)
+            self.widget3d = QWidget.createWindowContainer(window)
+            self.layout.addWidget(self.widget3d)
+        else:
+            self.layout.addWidget(QLabel("Failed to embed Open3D ProxyGeo viewport."))
+            
+        self.point_cloud = None
+        self.camera_linesets = []
+        self.mesh = None
+        
+        self.origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0)
+        self.grid = self.create_grid(size=100, divisions=100)
+        self.vis.add_geometry(self.origin_frame)
+        self.vis.add_geometry(self.grid)
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick_o3d)
+        self.timer.start(16)
+
+    def create_grid(self, size=100, divisions=100):
+        lines = []
+        points = []
+        step = size / divisions
+        half = size / 2.0
+        
+        idx = 0
+        for i in range(divisions + 1):
+            val = -half + i * step
+            points.extend([[val, 0, -half], [val, 0, half]])
+            lines.append([idx, idx + 1])
+            idx += 2
+            
+            points.extend([[-half, 0, val], [half, 0, val]])
+            lines.append([idx, idx + 1])
+            idx += 2
+            
+        grid = o3d.geometry.LineSet()
+        grid.points = o3d.utility.Vector3dVector(points)
+        grid.lines = o3d.utility.Vector2iVector(lines)
+        grid.colors = o3d.utility.Vector3dVector([[0.3, 0.3, 0.3] for _ in range(len(lines))])
+        return grid
+
+    def _tick_o3d(self):
+        self.vis.poll_events()
+        self.vis.update_renderer()
+
+    def load_solve_data(self, data_path, proxy_res):
+        if self.point_cloud:
+            self.vis.remove_geometry(self.point_cloud)
+        for ls in self.camera_linesets:
+            self.vis.remove_geometry(ls)
+        if self.mesh:
+            self.vis.remove_geometry(self.mesh)
+            
+        self.point_cloud = None
+        self.camera_linesets = []
+        self.mesh = None
+        if not os.path.exists(data_path): return
+        
+        data = np.load(data_path)
+        points_3d = data['points_3d']
+        points_mask = data['points_mask']
+        cameras_rot = data['cameras_rot']
+        cameras_trans = data['cameras_trans']
+        
+        valid_pts = points_3d[points_mask]
+        if len(valid_pts) > 0:
+            self.point_cloud = o3d.geometry.PointCloud()
+            self.point_cloud.points = o3d.utility.Vector3dVector(valid_pts)
+            self.point_cloud.paint_uniform_color([0.8, 0.8, 0.8])
+            self.vis.add_geometry(self.point_cloud)
+            
+        self.camera_linesets = []
+        for i in range(len(cameras_rot)):
+            R = cameras_rot[i]
+            T = cameras_trans[i]
+            if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)): continue
+            
+            ls = o3d.geometry.LineSet()
+            ls.points = o3d.utility.Vector3dVector(np.zeros((5, 3)))
+            lines = [[0,1], [0,2], [0,3], [0,4], [1,2], [2,3], [3,4], [4,1]]
+            ls.lines = o3d.utility.Vector2iVector(lines)
+            ls.colors = o3d.utility.Vector3dVector(np.tile([1, 0.5, 0], (8, 1)))
+            self.camera_linesets.append(ls)
+            self.vis.add_geometry(ls)
+            
+        focal_px = float(data['focal_px'])
+        plate_w, plate_h = proxy_res, proxy_res * 9 / 16
+        cx, cy = plate_w / 2, plate_h / 2
+        z = 0.5
+        x_max = (plate_w - cx) / focal_px * z
+        x_min = (0 - cx) / focal_px * z
+        y_max = (plate_h - cy) / focal_px * z
+        y_min = (0 - cy) / focal_px * z
+        frustum_pts = np.array([[0,0,0], [x_min,y_min,z], [x_max,y_min,z], [x_max,y_max,z], [x_min,y_max,z]])
+        
+        idx = 0
+        for i in range(len(cameras_rot)):
+            R = cameras_rot[i]
+            T = cameras_trans[i]
+            if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)): continue
+            R_inv = R.T
+            cam_center = -R_inv @ T
+            world_pts = (R_inv @ frustum_pts.T).T + cam_center
+            self.camera_linesets[idx].points = o3d.utility.Vector3dVector(world_pts)
+            self.vis.update_geometry(self.camera_linesets[idx])
+            idx += 1
+            
+        vc = self.vis.get_view_control()
+        vc.set_up([0, -1, 0])
+        vc.set_front([0, 0, -1])
+        vc.set_lookat([0, 0, 5])
+        vc.set_zoom(0.8)
+        self.vis.poll_events()
+        self.vis.update_renderer()
+
+    def load_proxy_mesh(self, mesh_path):
+        if self.mesh:
+            self.vis.remove_geometry(self.mesh)
+        if os.path.exists(mesh_path):
+            self.mesh = o3d.io.read_triangle_mesh(mesh_path)
+            self.mesh.compute_vertex_normals()
+            self.mesh.paint_uniform_color([0.5, 0.5, 0.5])
+            self.vis.add_geometry(self.mesh)
+            self.vis.poll_events()
+            self.vis.update_renderer()
+
+class TSDFWorker(QThread):
+    progress = Signal(int)
+    status = Signal(str)
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, project_dir, target_tris, subsample_rate, plate_w, plate_h):
+        super().__init__()
+        self.project_dir = project_dir
+        self.target_tris = target_tris
+        self.subsample_rate = subsample_rate
+        self.plate_w = plate_w
+        self.plate_h = plate_h
+
+    def run(self):
+        try:
+            from scipy.optimize import least_squares
+            
+            self.status.emit("Loading solve data...")
+            solve_path = os.path.join(self.project_dir, 'solve_data.npz')
+            if not os.path.exists(solve_path):
+                raise Exception("solve_data.npz not found.")
+                
+            data = np.load(solve_path)
+            points_3d = data['points_3d']
+            points_mask = data['points_mask']
+            cameras_rot = data['cameras_rot']
+            cameras_trans = data['cameras_trans']
+            focal_px = float(data['focal_px'])
+            visibility = data['visibility']
+            track_2d = data['tracks_2d']
+            
+            depth_dir = os.path.join(self.project_dir, 'depth_proxies')
+            if not os.path.exists(depth_dir):
+                raise Exception("AI Depth proxies not found. Please generate them in Setup/Solve tab first.")
+                
+            depth_files = sorted([f for f in os.listdir(depth_dir) if f.endswith('.npy')])
+            if not depth_files:
+                raise Exception("No .npy depth files found in depth_proxies directory.")
+                
+            first_depth = np.load(os.path.join(depth_dir, depth_files[0]))
+            H, W = first_depth.shape
+            
+            # CRITICAL: tracks_2d and focal_px are in NATIVE resolution (e.g. 3840x2160),
+            # but depth maps are at PROXY resolution (e.g. 1920x1080).
+            # Use the actual native plate dimensions passed from the UI.
+            native_w = self.plate_w
+            native_h = self.plate_h
+            
+            # Scale factor: native -> proxy (depth map) resolution
+            scale_x = W / native_w  
+            scale_y = H / native_h
+            
+            # Focal length scaled to proxy (depth map) resolution
+            focal_proxy = focal_px * scale_x
+            cx, cy = W / 2.0, H / 2.0
+            
+            num_frames = len(cameras_rot)
+
+            # --- Screen-Space Depth Meshing ---
+            # Instead of fusing noisy point clouds and hoping Poisson creates
+            # something clean, we build a structured triangle grid directly from
+            # each depth map's pixel grid. This guarantees clean, connected
+            # topology by construction.
+            
+            # Downsample factor for depth grid (every Nth pixel becomes a vertex)
+            grid_step = 4
+            grid_h = H // grid_step
+            grid_w = W // grid_step
+            
+            self.status.emit("Building screen-space depth meshes...")
+            
+            frames_to_process = list(range(0, num_frames, self.subsample_rate))
+            total_work = len(frames_to_process)
+            
+            all_vertices = []
+            all_triangles = []
+            vertex_offset = 0
+            
+            for idx, i in enumerate(frames_to_process):
+                if i >= len(depth_files): break
+                R = cameras_rot[i]
+                T = cameras_trans[i]
+                if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)): continue
+                
+                d_ai = np.load(os.path.join(depth_dir, depth_files[i]))
+                
+                # --- Per-frame affine depth alignment ---
+                visible_mask = visibility[i, :] > 0
+                frame_pts_mask = points_mask & visible_mask
+                frame_pts_3d = points_3d[frame_pts_mask]
+                
+                if len(frame_pts_3d) < 10:
+                    continue
+                    
+                pts_cam = (R @ frame_pts_3d.T).T + T
+                z_sfm = pts_cam[:, 2]
+                
+                valid_z = z_sfm > 0
+                if np.sum(valid_z) < 10: continue
+                
+                z_sfm = z_sfm[valid_z]
+                
+                pts_indices = np.where(frame_pts_mask)[0]
+                pts_indices = pts_indices[valid_z]
+                
+                # tracks_2d is in NATIVE resolution — scale to PROXY resolution for depth map sampling
+                x_px_native = track_2d[i, pts_indices, 0]
+                y_px_native = track_2d[i, pts_indices, 1]
+                x_px = x_px_native * scale_x
+                y_px = y_px_native * scale_y
+                
+                valid_px = (x_px >= 0) & (x_px < W-1) & (y_px >= 0) & (y_px < H-1)
+                if np.sum(valid_px) < 10: continue
+                
+                xi = np.clip(x_px[valid_px].astype(int), 0, W-1)
+                yi = np.clip(y_px[valid_px].astype(int), 0, H-1)
+                z_sfm_valid = z_sfm[valid_px]
+                
+                disp_ai = d_ai[yi, xi]
+                
+                # Fit in DISPARITY space: 1/z_sfm = a * disp + b
+                # This avoids catastrophic 1/0 and 1/negative explosions from raw disparity
+                inv_z_sfm = 1.0 / z_sfm_valid
+                valid_disp = disp_ai > 0.01
+                if np.sum(valid_disp) < 10: continue
+                
+                disp_fit = disp_ai[valid_disp]
+                inv_z_fit = inv_z_sfm[valid_disp]
+                
+                def loss_func_disp(params, disp, inv_z):
+                    a, b = params
+                    return (a * disp + b) - inv_z
+                
+                a_g = np.median(inv_z_fit) / (np.median(disp_fit) + 1e-6)
+                b_g = np.median(inv_z_fit) - a_g * np.median(disp_fit)
+                
+                res = least_squares(
+                    loss_func_disp, [a_g, b_g], loss='soft_l1', args=(disp_fit, inv_z_fit)
+                )
+                a, b = res.x
+                
+                # Convert full depth map to metric depth: z = 1 / (a*disp + b)
+                inv_metric = a * d_ai + b
+                metric_depth = np.where(inv_metric > 1e-6, 1.0 / inv_metric, 200.0)
+                metric_depth = np.clip(metric_depth, 0.1, 200.0)
+                
+                # Bilateral filter: smooths noise while preserving sharp depth edges
+                import cv2
+                metric_f32 = metric_depth.astype(np.float32)
+                metric_depth = cv2.bilateralFilter(metric_f32, d=9, sigmaColor=5.0, sigmaSpace=9.0).astype(np.float64)
+                
+                # --- Build screen-space grid mesh for this frame ---
+                # Sample at grid_step intervals
+                gy, gx = np.mgrid[0:grid_h, 0:grid_w]
+                py = gy * grid_step  # pixel y coordinates in proxy space
+                px = gx * grid_step  # pixel x coordinates in proxy space
+                py = np.clip(py, 0, H-1)
+                px = np.clip(px, 0, W-1)
+                
+                depths = metric_depth[py, px]  # (grid_h, grid_w)
+                
+                # Back-project proxy pixels to camera space using PROXY-scaled focal
+                cam_x = (px - cx) / focal_proxy * depths
+                cam_y = (py - cy) / focal_proxy * depths
+                cam_z = depths
+                
+                # Stack into (grid_h, grid_w, 3)
+                pts_cam_grid = np.stack([cam_x, cam_y, cam_z], axis=-1)
+                
+                # Transform camera → world:  P_world = R^T @ (P_cam - T)
+                R_inv = R.T
+                cam_center = -R_inv @ T
+                pts_flat = pts_cam_grid.reshape(-1, 3)
+                pts_world = (R_inv @ (pts_flat - T).T).T  # (N, 3)
+                
+                # Build triangle indices for the grid — fully vectorised
+                # Grid of top-left vertex indices for every quad cell
+                rows = np.arange(grid_h - 1)
+                cols = np.arange(grid_w - 1)
+                row_idx, col_idx = np.meshgrid(rows, cols, indexing='ij')  # (R-1, C-1)
+                
+                v00 = (row_idx * grid_w + col_idx).ravel()
+                v01 = (row_idx * grid_w + col_idx + 1).ravel()
+                v10 = ((row_idx + 1) * grid_w + col_idx).ravel()
+                v11 = ((row_idx + 1) * grid_w + col_idx + 1).ravel()
+                
+                # Depth at each quad corner
+                d00 = depths[row_idx, col_idx].ravel()
+                d01 = depths[row_idx, col_idx + 1].ravel()
+                d10 = depths[row_idx + 1, col_idx].ravel()
+                d11 = depths[row_idx + 1, col_idx + 1].ravel()
+                
+                # Depth discontinuity filter — all in one vectorised expression
+                quad_max = np.maximum(np.maximum(d00, d01), np.maximum(d10, d11))
+                quad_min = np.minimum(np.minimum(d00, d01), np.minimum(d10, d11))
+                keep = (quad_max > 0.1) & ((quad_max - quad_min) / (quad_min + 1e-6) < 0.3)
+                
+                v00k = v00[keep] + vertex_offset
+                v01k = v01[keep] + vertex_offset
+                v10k = v10[keep] + vertex_offset
+                v11k = v11[keep] + vertex_offset
+                
+                # Two triangles per quad, stacked as (N, 3)
+                # Note: Winding order reversed (v10k before v01k) so normals point toward camera
+                tri_a = np.stack([v00k, v10k, v01k], axis=1)
+                tri_b = np.stack([v01k, v10k, v11k], axis=1)
+                frame_tris_arr = np.vstack([tri_a, tri_b]).astype(np.int32)
+                
+                all_vertices.append(pts_world)
+                if len(frame_tris_arr) > 0:
+                    all_triangles.append(frame_tris_arr)
+                vertex_offset += pts_world.shape[0]
+                
+                self.progress.emit(int((idx / total_work) * 60))
+            
+            if not all_vertices:
+                raise Exception("No valid frames could be processed.")
+                
+            self.status.emit("Merging mesh fragments...")
+            combined_verts = np.vstack(all_vertices).astype(np.float64)
+            if all_triangles:
+                combined_tris = np.vstack(all_triangles).astype(np.int32)
+            else:
+                raise Exception("No triangles were generated.")
+            
+            mesh = o3d.geometry.TriangleMesh()
+            mesh.vertices = o3d.utility.Vector3dVector(combined_verts)
+            mesh.triangles = o3d.utility.Vector3iVector(combined_tris)
+            
+            self.progress.emit(65)
+            self.status.emit("Cleaning up mesh...")
+            
+            # Remove degenerate and duplicated triangles
+            mesh.remove_degenerate_triangles()
+            mesh.remove_duplicated_triangles()
+            mesh.remove_duplicated_vertices()
+            mesh.remove_unreferenced_vertices()
+            
+            # Keep only the largest connected component
+            try:
+                triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
+                triangle_clusters = np.asarray(triangle_clusters)
+                cluster_n_triangles = np.asarray(cluster_n_triangles)
+                
+                if len(cluster_n_triangles) > 1:
+                    # Keep the top N clusters that contain >1% of total triangles
+                    total_tris = len(mesh.triangles)
+                    min_cluster_size = max(total_tris * 0.01, 100)
+                    triangles_to_remove = cluster_n_triangles[triangle_clusters] < min_cluster_size
+                    mesh.remove_triangles_by_mask(triangles_to_remove)
+                    mesh.remove_unreferenced_vertices()
+            except Exception as e:
+                print("Mesh clustering failed:", e)
+            
+            self.progress.emit(75)
+            self.status.emit("Snapping to SfM point cloud...")
+            
+            # Snap nearest mesh vertices to exact SfM 3D positions
+            # Use scipy cKDTree for a single vectorised batch query over all SfM points
+            valid_sfm_points = points_3d[points_mask]
+            if len(valid_sfm_points) > 0 and len(mesh.vertices) > 0:
+                from scipy.spatial import cKDTree
+                mesh_verts = np.asarray(mesh.vertices).copy()
+                tree = cKDTree(mesh_verts)
+                dists, vert_indices = tree.query(valid_sfm_points, workers=-1)
+                snap_mask = dists < 5.0
+                mesh_verts[vert_indices[snap_mask]] = valid_sfm_points[snap_mask]
+                mesh.vertices = o3d.utility.Vector3dVector(mesh_verts)
+            
+            self.progress.emit(85)
+            self.status.emit("Smoothing mesh...")
+            
+            # Taubin smoothing: removes noise/spikes while preserving volume
+            # (unlike Laplacian which shrinks the mesh)
+            mesh = mesh.filter_smooth_taubin(number_of_iterations=10)
+            
+            self.status.emit("Decimating mesh...")
+            
+            if len(mesh.triangles) > self.target_tris:
+                mesh = mesh.simplify_quadric_decimation(self.target_tris)
+            
+            mesh.compute_vertex_normals()
+            
+            out_path = os.path.join(self.project_dir, 'proxy_geo.obj')
+            o3d.io.write_triangle_mesh(out_path, mesh)
+                
+            self.progress.emit(100)
+            self.finished.emit()
+            
+        except Exception as e:
+            import traceback
+            self.error.emit(str(e) + "\\n" + traceback.format_exc())
+
 class MainWindow(QMainWindow):
     def closeEvent(self, event):
         # Kill daemon process if running
@@ -1987,7 +2427,7 @@ class MainWindow(QMainWindow):
             self.daemon_process.join()
             
         # Kill workers
-        workers = ['dl_worker', 'ai_depth_worker', 'proxy_worker']
+        workers = ['dl_worker', 'ai_depth_worker', 'proxy_worker', 'tsdf_worker']
         for w in workers:
             if hasattr(self, w):
                 worker = getattr(self, w)
@@ -2043,6 +2483,10 @@ class MainWindow(QMainWindow):
         self.solve_tab = QWidget()
         self.tabs.addTab(self.solve_tab, "Solve")
         self.init_solve_tab()
+        
+        self.proxy_geo_tab = QWidget()
+        self.tabs.addTab(self.proxy_geo_tab, "Proxy Geo")
+        self.init_proxy_geo_tab()
         
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
@@ -2483,10 +2927,101 @@ class MainWindow(QMainWindow):
         
         self.solve_tab.setLayout(self.solve_layout)
 
-    def toggle_solve_view(self):
-        if not hasattr(self, 'project_dir') or not self.project_dir: return
-        data_path = os.path.join(self.project_dir, 'solve_data.npz')
+    def init_proxy_geo_tab(self):
+        layout = QVBoxLayout()
         
+        ctrl_layout = QHBoxLayout()
+        
+        self.btn_gen_proxy_geo = QPushButton("Generate Proxy Geometry")
+        self.btn_gen_proxy_geo.setMinimumHeight(40)
+        self.btn_gen_proxy_geo.clicked.connect(self.run_tsdf_worker)
+        
+        self.spin_target_tris = QSpinBox()
+        self.spin_target_tris.setRange(1000, 1000000)
+        self.spin_target_tris.setValue(50000)
+        self.spin_target_tris.setSingleStep(5000)
+        
+        self.spin_subsample = QSpinBox()
+        self.spin_subsample.setRange(1, 100)
+        self.spin_subsample.setValue(5)
+        self.spin_subsample.setToolTip("Temporal subsampling: process every Nth frame")
+        
+        ctrl_layout.addWidget(QLabel("Target Triangles:"))
+        ctrl_layout.addWidget(self.spin_target_tris)
+        ctrl_layout.addWidget(QLabel("Subsample Step:"))
+        ctrl_layout.addWidget(self.spin_subsample)
+        ctrl_layout.addWidget(self.btn_gen_proxy_geo)
+        
+        layout.addLayout(ctrl_layout)
+        
+        self.lbl_proxy_geo_status = QLabel("")
+        layout.addWidget(self.lbl_proxy_geo_status)
+        
+        self.proxy_geo_progress = QProgressBar()
+        self.proxy_geo_progress.setValue(0)
+        self.proxy_geo_progress.hide()
+        layout.addWidget(self.proxy_geo_progress)
+        
+        from PySide6.QtWidgets import QSplitter
+        self.proxy_geo_splitter = QSplitter(Qt.Horizontal)
+        
+        self.proxy_geo_2d_viewport = SequenceViewerWidget(self, interactive=False, show_tracks=False)
+        self.proxy_geo_3d_viewport = ProxyGeoViewport()
+        
+        self.proxy_geo_splitter.addWidget(self.proxy_geo_2d_viewport)
+        self.proxy_geo_splitter.addWidget(self.proxy_geo_3d_viewport)
+        self.proxy_geo_splitter.setSizes([500, 500])
+        
+        layout.addWidget(self.proxy_geo_splitter, stretch=1)
+        self.proxy_geo_tab.setLayout(layout)
+        
+    def run_tsdf_worker(self):
+        if not self.project_dir:
+            QMessageBox.warning(self, "Error", "No project loaded.")
+            return
+            
+        self.btn_gen_proxy_geo.setEnabled(False)
+        self.proxy_geo_progress.setValue(0)
+        self.proxy_geo_progress.show()
+        
+        plate_w = self.camera_setup_data.get('plate_width', 3840)
+        plate_h = self.camera_setup_data.get('plate_height', 2160)
+        self.tsdf_worker = TSDFWorker(
+            self.project_dir, 
+            self.spin_target_tris.value(),
+            self.spin_subsample.value(),
+            plate_w,
+            plate_h
+        )
+        self.tsdf_worker.progress.connect(self.proxy_geo_progress.setValue)
+        self.tsdf_worker.status.connect(self.lbl_proxy_geo_status.setText)
+        self.tsdf_worker.finished.connect(self.on_tsdf_finished)
+        self.tsdf_worker.error.connect(self.on_tsdf_error)
+        self.tsdf_worker.start()
+        
+    def on_tsdf_finished(self):
+        self.lbl_proxy_geo_status.setText("Proxy Geometry Generated!")
+        self.btn_gen_proxy_geo.setEnabled(True)
+        mesh_path = os.path.join(self.project_dir, 'proxy_geo.obj')
+        self.proxy_geo_3d_viewport.load_proxy_mesh(mesh_path)
+        
+    def on_tsdf_error(self, err):
+        self.lbl_proxy_geo_status.setText("Error generating proxy geometry.")
+        self.btn_gen_proxy_geo.setEnabled(True)
+        QMessageBox.critical(self, "TSDF Error", err)
+
+    def toggle_solve_view(self):
+        if not hasattr(self, 'project_dir') or not self.project_dir:
+            QMessageBox.warning(self, "Error", "No project loaded.")
+            return
+            
+        data_path = os.path.join(self.project_dir, 'solve_data.npz')
+        raw_data_path = os.path.join(self.project_dir, 'solve_data_raw.npz')
+        
+        if not os.path.exists(data_path) or not os.path.exists(raw_data_path):
+            QMessageBox.warning(self, "Error", "Solve data is missing. Please run VGGSfM first.")
+            return
+            
         if not hasattr(self, 'viewing_raw'):
             self.viewing_raw = False
             
@@ -2507,7 +3042,15 @@ class MainWindow(QMainWindow):
             self.btn_toggle_view.setText("Preview Raw Data")
 
     def revert_solve(self):
-        if not hasattr(self, 'project_dir') or not self.project_dir: return
+        if not hasattr(self, 'project_dir') or not self.project_dir:
+            QMessageBox.warning(self, "Error", "No project loaded.")
+            return
+            
+        raw_data_path = os.path.join(self.project_dir, 'solve_data_raw.npz')
+        if not os.path.exists(raw_data_path):
+            QMessageBox.warning(self, "Error", "Raw solve backup not found. Please run VGGSfM first.")
+            return
+            
         self.viewing_raw = False
         if hasattr(self, 'btn_toggle_view'):
             self.btn_toggle_view.setStyleSheet("")
@@ -2537,6 +3080,7 @@ class MainWindow(QMainWindow):
         frames_dir = os.path.join(self.project_dir, "proxies")
         frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith('.jpg') or f.endswith('.png')])
         if not frame_files:
+            QMessageBox.warning(self, "Error", "No proxies found.")
             return
             
         mode_idx = self.combo_ai_mode.currentIndex()
@@ -3286,6 +3830,7 @@ class MainWindow(QMainWindow):
 
     def generate_depth_sequence(self):
         if not self.exr_files or not self.project_dir:
+            QMessageBox.warning(self, "Warning", "Please load a sequence and generate proxies in the Setup tab first.")
             return
             
         proxies_dir = os.path.join(self.project_dir, 'proxies')
@@ -3389,6 +3934,16 @@ class MainWindow(QMainWindow):
             self.tracking_viewer.update_sequence(self.exr_files, getattr(self, 'color_space', CS_LINEAR_SRGB), self.project_dir)
             if self.exr_files and hasattr(self, 'btn_run_tracking'):
                 self.btn_run_tracking.setEnabled(True)
+
+        elif self.tabs.widget(index) == getattr(self, 'proxy_geo_tab', None):
+            self.proxy_geo_2d_viewport.update_sequence(self.exr_files, getattr(self, 'color_space', CS_LINEAR_SRGB), self.project_dir)
+            if self.project_dir:
+                solve_path = os.path.join(self.project_dir, 'solve_data.npz')
+                if os.path.exists(solve_path):
+                    self.proxy_geo_3d_viewport.load_solve_data(solve_path, self.proxy_res)
+                mesh_path = os.path.join(self.project_dir, 'proxy_geo.obj')
+                if os.path.exists(mesh_path):
+                    self.proxy_geo_3d_viewport.load_proxy_mesh(mesh_path)
 
     def start_daemon(self):
         self.cmd_queue = multiprocessing.Queue()
