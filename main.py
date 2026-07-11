@@ -2131,10 +2131,9 @@ class TSDFWorker(QThread):
     finished = Signal()
     error = Signal(str)
 
-    def __init__(self, project_dir, target_tris, subsample_rate, plate_w, plate_h):
+    def __init__(self, project_dir, subsample_rate, plate_w, plate_h):
         super().__init__()
         self.project_dir = project_dir
-        self.target_tris = target_tris
         self.subsample_rate = subsample_rate
         self.plate_w = plate_w
         self.plate_h = plate_h
@@ -2401,23 +2400,73 @@ class TSDFWorker(QThread):
             # Taubin smoothing: removes noise/spikes while preserving volume
             # (unlike Laplacian which shrinks the mesh)
             mesh = mesh.filter_smooth_taubin(number_of_iterations=10)
-            
-            self.status.emit("Decimating mesh...")
-            
-            if len(mesh.triangles) > self.target_tris:
-                mesh = mesh.simplify_quadric_decimation(self.target_tris)
-            
             mesh.compute_vertex_normals()
             
+            self.status.emit("Saving raw geometry...")
+            raw_path = os.path.join(self.project_dir, 'proxy_geo_raw.obj')
             out_path = os.path.join(self.project_dir, 'proxy_geo.obj')
-            o3d.io.write_triangle_mesh(out_path, mesh)
+            o3d.io.write_triangle_mesh(raw_path, mesh)
+            o3d.io.write_triangle_mesh(out_path, mesh) # Also write as active
                 
             self.progress.emit(100)
             self.finished.emit()
             
         except Exception as e:
             import traceback
-            self.error.emit(str(e) + "\\n" + traceback.format_exc())
+            self.error.emit(str(e) + "\n" + traceback.format_exc())
+
+class DecimateWorker(QThread):
+    progress = Signal(int)
+    status = Signal(str)
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, project_dir, target_tris):
+        super().__init__()
+        self.project_dir = project_dir
+        self.target_tris = target_tris
+
+    def run(self):
+        try:
+            import open3d as o3d
+            
+            self.status.emit("Loading raw mesh...")
+            self.progress.emit(10)
+            
+            raw_path = os.path.join(self.project_dir, 'proxy_geo_raw.obj')
+            if not os.path.exists(raw_path):
+                # Fall back to current proxy_geo if raw doesn't exist
+                raw_path = os.path.join(self.project_dir, 'proxy_geo.obj')
+                if not os.path.exists(raw_path):
+                    raise Exception("No proxy geometry found to decimate.")
+                    
+            mesh = o3d.io.read_triangle_mesh(raw_path)
+            
+            if len(mesh.triangles) <= self.target_tris:
+                self.status.emit("Mesh already at or below target triangles.")
+                self.progress.emit(100)
+                self.finished.emit()
+                return
+                
+            self.status.emit("Decimating mesh...")
+            self.progress.emit(30)
+            
+            mesh = mesh.simplify_quadric_decimation(self.target_tris)
+            
+            self.progress.emit(80)
+            self.status.emit("Computing normals...")
+            mesh.compute_vertex_normals()
+            
+            self.status.emit("Saving mesh...")
+            out_path = os.path.join(self.project_dir, 'proxy_geo.obj')
+            o3d.io.write_triangle_mesh(out_path, mesh)
+            
+            self.progress.emit(100)
+            self.finished.emit()
+            
+        except Exception as e:
+            import traceback
+            self.error.emit(str(e) + "\n" + traceback.format_exc())
 
 class MainWindow(QMainWindow):
     def closeEvent(self, event):
@@ -2932,9 +2981,17 @@ class MainWindow(QMainWindow):
         
         ctrl_layout = QHBoxLayout()
         
-        self.btn_gen_proxy_geo = QPushButton("Generate Proxy Geometry")
+        self.btn_gen_proxy_geo = QPushButton("Generate Raw Geometry")
         self.btn_gen_proxy_geo.setMinimumHeight(40)
         self.btn_gen_proxy_geo.clicked.connect(self.run_tsdf_worker)
+        
+        self.btn_decimate_proxy_geo = QPushButton("Decimate Mesh")
+        self.btn_decimate_proxy_geo.setMinimumHeight(40)
+        self.btn_decimate_proxy_geo.clicked.connect(self.run_decimate_worker)
+        
+        self.btn_revert_proxy_geo = QPushButton("Revert to Raw")
+        self.btn_revert_proxy_geo.setMinimumHeight(40)
+        self.btn_revert_proxy_geo.clicked.connect(self.revert_proxy_geo)
         
         self.spin_target_tris = QSpinBox()
         self.spin_target_tris.setRange(1000, 1000000)
@@ -2951,6 +3008,8 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(QLabel("Subsample Step:"))
         ctrl_layout.addWidget(self.spin_subsample)
         ctrl_layout.addWidget(self.btn_gen_proxy_geo)
+        ctrl_layout.addWidget(self.btn_decimate_proxy_geo)
+        ctrl_layout.addWidget(self.btn_revert_proxy_geo)
         
         layout.addLayout(ctrl_layout)
         
@@ -2988,7 +3047,6 @@ class MainWindow(QMainWindow):
         plate_h = self.camera_setup_data.get('plate_height', 2160)
         self.tsdf_worker = TSDFWorker(
             self.project_dir, 
-            self.spin_target_tris.value(),
             self.spin_subsample.value(),
             plate_w,
             plate_h
@@ -3000,15 +3058,59 @@ class MainWindow(QMainWindow):
         self.tsdf_worker.start()
         
     def on_tsdf_finished(self):
-        self.lbl_proxy_geo_status.setText("Proxy Geometry Generated!")
+        self.lbl_proxy_geo_status.setText("Raw Proxy Geometry Generated!")
         self.btn_gen_proxy_geo.setEnabled(True)
-        mesh_path = os.path.join(self.project_dir, 'proxy_geo.obj')
+        mesh_path = os.path.join(self.project_dir, 'proxy_geo_raw.obj')
         self.proxy_geo_3d_viewport.load_proxy_mesh(mesh_path)
         
     def on_tsdf_error(self, err):
-        self.lbl_proxy_geo_status.setText("Error generating proxy geometry.")
+        self.lbl_proxy_geo_status.setText("Error generating geometry.")
         self.btn_gen_proxy_geo.setEnabled(True)
-        QMessageBox.critical(self, "TSDF Error", err)
+        if hasattr(self, 'btn_decimate_proxy_geo'):
+            self.btn_decimate_proxy_geo.setEnabled(True)
+            self.btn_revert_proxy_geo.setEnabled(True)
+        QMessageBox.critical(self, "Geometry Error", err)
+        
+    def run_decimate_worker(self):
+        if not self.project_dir:
+            QMessageBox.warning(self, "Error", "No project loaded.")
+            return
+            
+        self.btn_decimate_proxy_geo.setEnabled(False)
+        self.btn_gen_proxy_geo.setEnabled(False)
+        self.btn_revert_proxy_geo.setEnabled(False)
+        self.proxy_geo_progress.setValue(0)
+        self.proxy_geo_progress.show()
+        
+        self.decimate_worker = DecimateWorker(
+            self.project_dir, 
+            self.spin_target_tris.value()
+        )
+        self.decimate_worker.progress.connect(self.proxy_geo_progress.setValue)
+        self.decimate_worker.status.connect(self.lbl_proxy_geo_status.setText)
+        self.decimate_worker.finished.connect(self.on_decimate_finished)
+        self.decimate_worker.error.connect(self.on_tsdf_error)
+        self.decimate_worker.start()
+
+    def on_decimate_finished(self):
+        self.lbl_proxy_geo_status.setText("Mesh Decimated!")
+        self.btn_decimate_proxy_geo.setEnabled(True)
+        self.btn_gen_proxy_geo.setEnabled(True)
+        self.btn_revert_proxy_geo.setEnabled(True)
+        mesh_path = os.path.join(self.project_dir, 'proxy_geo.obj')
+        self.proxy_geo_3d_viewport.load_proxy_mesh(mesh_path)
+        
+    def revert_proxy_geo(self):
+        if not self.project_dir: return
+        raw_path = os.path.join(self.project_dir, 'proxy_geo_raw.obj')
+        if not os.path.exists(raw_path):
+            QMessageBox.warning(self, "Error", "No raw mesh found to revert to.")
+            return
+        import shutil
+        out_path = os.path.join(self.project_dir, 'proxy_geo.obj')
+        shutil.copy(raw_path, out_path)
+        self.proxy_geo_3d_viewport.load_proxy_mesh(out_path)
+        self.lbl_proxy_geo_status.setText("Reverted to raw mesh.")
 
     def toggle_solve_view(self):
         if not hasattr(self, 'project_dir') or not self.project_dir:
