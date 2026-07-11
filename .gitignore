@@ -44,6 +44,15 @@ models/
 weights/
 checkpoints/
 
-# Temporary test artifacts
+# Temporary run artifacts & downloaded repos
 temp_masks/
-test_daemon.py
+temp_vggsfm_repo/
+*.db
+0/
+1/
+CHECK.txt
+pairs.txt
+cameras.json
+
+# Test scripts
+test_*.py
