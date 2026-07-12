@@ -1449,16 +1449,60 @@ class ProxyGeneratorWorker(QThread):
                 
                 inp = oiio.ImageInput.open(frame_path)
                 spec = inp.spec()
-                native_w, native_h = spec.width, spec.height
-                has_alpha = spec.nchannels >= 4
+                
+                # Use display window (full_width/full_height) to include overscan padding
+                native_w = spec.full_width if spec.full_width > 0 else spec.width
+                native_h = spec.full_height if spec.full_height > 0 else spec.height
+                
+                # Check for alpha channel explicitly
+                alpha_idx = -1
+                for idx, name in enumerate(spec.channelnames):
+                    if name.lower() in ['a', 'alpha', 'rgba.a']:
+                        alpha_idx = idx
+                        break
+                
+                has_alpha = alpha_idx != -1
                 
                 needs_proxy = not os.path.exists(proxy_path)
-                needs_alpha = has_alpha and not os.path.exists(alpha_path)
+                # Force rebuild alpha if we are rebuilding the proxy to keep them perfectly in sync
+                needs_alpha = has_alpha and (not os.path.exists(alpha_path) or needs_proxy)
                 
                 if needs_proxy or needs_alpha:
-                    image_data = inp.read_image()
+                    data_window_img = inp.read_image()
+                    
+                    offset_x = spec.x - spec.full_x
+                    offset_y = spec.y - spec.full_y
+                    
+                    if native_w != spec.width or native_h != spec.height or offset_x != 0 or offset_y != 0:
+                        image_data = np.zeros((native_h, native_w, data_window_img.shape[2]), dtype=data_window_img.dtype)
+                        y_start = max(0, offset_y)
+                        y_end = min(native_h, offset_y + spec.height)
+                        x_start = max(0, offset_x)
+                        x_end = min(native_w, offset_x + spec.width)
+                        
+                        data_y_start = max(0, -offset_y)
+                        data_y_end = data_y_start + (y_end - y_start)
+                        data_x_start = max(0, -offset_x)
+                        data_x_end = data_x_start + (x_end - x_start)
+                        
+                        if y_start < y_end and x_start < x_end:
+                            image_data[y_start:y_end, x_start:x_end] = data_window_img[data_y_start:data_y_end, data_x_start:data_x_end]
+                    else:
+                        image_data = data_window_img
+                        
                     if needs_proxy:
-                        rgb_array = image_data[:, :, :3] if image_data.shape[2] >= 3 else np.stack((image_data,)*3, axis=-1)
+                        # Extract RGB channels correctly
+                        r_idx, g_idx, b_idx = 0, 1, 2
+                        for idx, name in enumerate(spec.channelnames):
+                            if name.lower() in ['r', 'rgba.r']: r_idx = idx
+                            elif name.lower() in ['g', 'rgba.g']: g_idx = idx
+                            elif name.lower() in ['b', 'rgba.b']: b_idx = idx
+                            
+                        if image_data.shape[2] >= 3:
+                            rgb_array = image_data[:, :, [r_idx, g_idx, b_idx]]
+                        else:
+                            rgb_array = np.stack((image_data[:,:,0],)*3, axis=-1)
+                            
                         srgb_array = apply_color_space(rgb_array, self.color_space)
                         rgb_uint8 = np.clip(srgb_array * 255.0, 0, 255).astype(np.uint8)
                         scale = self.proxy_res / max(native_w, native_h) if (native_w > self.proxy_res or native_h > self.proxy_res) else 1.0
@@ -1470,7 +1514,7 @@ class ProxyGeneratorWorker(QThread):
                         cv2.imwrite(proxy_path, cv2.cvtColor(proxy_img, cv2.COLOR_RGB2BGR))
                         
                     if needs_alpha:
-                        alpha_uint8 = np.clip(image_data[:, :, 3] * 255.0, 0, 255).astype(np.uint8)
+                        alpha_uint8 = np.clip(image_data[:, :, alpha_idx] * 255.0, 0, 255).astype(np.uint8)
                         # Invert alpha: user specifies black is masked out. We need White=Excluded for SAM 2 logic.
                         alpha_uint8 = 255 - alpha_uint8
                         cv2.imwrite(alpha_path, alpha_uint8)
@@ -1478,14 +1522,18 @@ class ProxyGeneratorWorker(QThread):
                 if has_alpha:
                     base_name = os.path.splitext(os.path.basename(frame_path))[0]
                     mask_path_out = os.path.join(masks_dir, f"{base_name}_mask.png")
-                    if not os.path.exists(mask_path_out) and os.path.exists(alpha_path):
-                        import shutil
-                        shutil.copy(alpha_path, mask_path_out)
+                    # Force overwrite the mask_path_out if we just rebuilt the alpha
+                    if needs_alpha or not os.path.exists(mask_path_out):
+                        if os.path.exists(alpha_path):
+                            import shutil
+                            shutil.copy(alpha_path, mask_path_out)
                         
                 inp.close()
                 return i, (native_w, native_h)
 
-            with concurrent.futures.ThreadPoolExecutor() as executor:
+            # Limit max_workers to prevent RAM exhaustion and thread-thrashing with EXRs
+            safe_workers = max(1, min(os.cpu_count() or 4, 8))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=safe_workers) as executor:
                 futures = {executor.submit(process_frame, i, path): i for i, path in enumerate(self.exr_files)}
                 completed = 0
                 for future in concurrent.futures.as_completed(futures):
