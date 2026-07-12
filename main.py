@@ -1962,21 +1962,11 @@ class SolveViewport(QWidget):
             
         plate_w = self.camera_setup_data.get('plate_width', 1920)
         plate_h = self.camera_setup_data.get('plate_height', 1080)
-        
-        win_w = self.widget3d.width() if hasattr(self, 'widget3d') else 800
-        win_h = self.widget3d.height() if hasattr(self, 'widget3d') else 600
-        if win_w <= 0 or win_h <= 0:
-            win_w, win_h = 800, 600
-            
-        scale_x = win_w / plate_w
-        scale_y = win_h / plate_h
-        scale = min(scale_x, scale_y)
-        
-        cx, cy = win_w / 2.0, win_h / 2.0
-        fx = fy = self.focal_px * scale
+        cx, cy = plate_w / 2.0, plate_h / 2.0
+        fx = fy = self.focal_px
         
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
-            width=int(win_w), height=int(win_h), fx=fx, fy=fy, cx=cx, cy=cy
+            width=int(plate_w), height=int(plate_h), fx=fx, fy=fy, cx=cx, cy=cy
         )
         
         cam_params = o3d.camera.PinholeCameraParameters()
@@ -2366,21 +2356,11 @@ class ProxyGeoViewport(QWidget):
             return
             
         plate_w, plate_h = self.plate_w, self.plate_h
-        
-        win_w = self.widget3d.width() if hasattr(self, 'widget3d') else 800
-        win_h = self.widget3d.height() if hasattr(self, 'widget3d') else 600
-        if win_w <= 0 or win_h <= 0:
-            win_w, win_h = 800, 600
-            
-        scale_x = win_w / plate_w
-        scale_y = win_h / plate_h
-        scale = min(scale_x, scale_y)
-        
-        cx, cy = win_w / 2.0, win_h / 2.0
-        fx = fy = self.focal_px * scale
+        cx, cy = plate_w / 2.0, plate_h / 2.0
+        fx = fy = self.focal_px
         
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
-            width=int(win_w), height=int(win_h), fx=fx, fy=fy, cx=cx, cy=cy
+            width=int(plate_w), height=int(plate_h), fx=fx, fy=fy, cx=cx, cy=cy
         )
         
         cam_params = o3d.camera.PinholeCameraParameters()
