@@ -1843,6 +1843,10 @@ class SolveViewport(QWidget):
             self.vis.remove_geometry(ls, reset_bounding_box=reset_view)
         self.camera_linesets.clear()
         
+        if hasattr(self, 'path_ls') and self.path_ls is not None:
+            self.vis.remove_geometry(self.path_ls, reset_bounding_box=reset_view)
+            self.path_ls = None
+        
         self.pcd = o3d.geometry.PointCloud()
         self.vis.add_geometry(self.pcd, reset_bounding_box=reset_view)
         self.update_error_threshold()
@@ -1893,11 +1897,11 @@ class SolveViewport(QWidget):
             
         if len(path_pts) > 1:
             path_lines = [[j, j+1] for j in range(len(path_pts)-1)]
-            path_ls = o3d.geometry.LineSet()
-            path_ls.points = o3d.utility.Vector3dVector(np.array(path_pts))
-            path_ls.lines = o3d.utility.Vector2iVector(path_lines)
-            path_ls.colors = o3d.utility.Vector3dVector([[1,1,0] for _ in range(len(path_lines))])
-            self.vis.add_geometry(path_ls, reset_bounding_box=reset_view)
+            self.path_ls = o3d.geometry.LineSet()
+            self.path_ls.points = o3d.utility.Vector3dVector(np.array(path_pts))
+            self.path_ls.lines = o3d.utility.Vector2iVector(path_lines)
+            self.path_ls.colors = o3d.utility.Vector3dVector([[1,1,0] for _ in range(len(path_lines))])
+            self.vis.add_geometry(self.path_ls, reset_bounding_box=reset_view)
             
         if reset_view:
             self.vis.reset_view_point(True)
@@ -1921,8 +1925,24 @@ class SolveViewport(QWidget):
         self.activeCameraChanged.emit(idx)
         
     def update_perspective(self):
-        if self.combo_perspective.currentText() == "Scene Camera":
+        is_scene_cam = self.combo_perspective.currentText() == "Scene Camera"
+        if is_scene_cam:
             self.sync_perspective_to_camera()
+            
+        for ls in self.camera_linesets:
+            if is_scene_cam:
+                self.vis.remove_geometry(ls, reset_bounding_box=False)
+            else:
+                self.vis.add_geometry(ls, reset_bounding_box=False)
+                
+        if hasattr(self, 'path_ls') and self.path_ls is not None:
+            if is_scene_cam:
+                self.vis.remove_geometry(self.path_ls, reset_bounding_box=False)
+            else:
+                self.vis.add_geometry(self.path_ls, reset_bounding_box=False)
+                
+        if not is_scene_cam:
+            self.update_active_camera()
             
     def sync_perspective_to_camera(self, idx=None):
         if idx is None:
@@ -2296,8 +2316,18 @@ class ProxyGeoViewport(QWidget):
             self.sync_perspective_to_camera(idx)
             
     def update_perspective(self):
-        if self.combo_perspective.currentText() == "Scene Camera":
+        is_scene_cam = self.combo_perspective.currentText() == "Scene Camera"
+        if is_scene_cam:
             self.sync_perspective_to_camera(self.current_idx)
+            
+        for ls in self.camera_linesets:
+            if is_scene_cam:
+                self.vis.remove_geometry(ls, reset_bounding_box=False)
+            else:
+                self.vis.add_geometry(ls, reset_bounding_box=False)
+                
+        if not is_scene_cam:
+            self.update_active_camera(self.current_idx)
             
     def sync_perspective_to_camera(self, idx):
         if not hasattr(self, 'cameras_rot') or idx >= len(self.cameras_rot): return
