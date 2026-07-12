@@ -1717,6 +1717,23 @@ class SolveViewport(QWidget):
         row2.addWidget(self.btn_apply_orient)
         self.control_layout.addLayout(row2)
         
+        persp_layout = QHBoxLayout()
+        persp_layout.addWidget(QLabel("Perspective:"))
+        self.combo_perspective = QComboBox()
+        self.combo_perspective.addItems(["Free Camera", "Scene Camera"])
+        self.combo_perspective.currentIndexChanged.connect(self.update_perspective)
+        persp_layout.addWidget(self.combo_perspective)
+        self.control_layout.addLayout(persp_layout)
+        
+        origin_scale_layout = QHBoxLayout()
+        origin_scale_layout.addWidget(QLabel("Origin Axis Size:"))
+        self.slider_origin_scale = QSlider(Qt.Horizontal)
+        self.slider_origin_scale.setRange(1, 200)
+        self.slider_origin_scale.setValue(50)
+        self.slider_origin_scale.valueChanged.connect(self.update_origin_scale)
+        origin_scale_layout.addWidget(self.slider_origin_scale)
+        self.control_layout.addLayout(origin_scale_layout)
+        
         cam_scale_layout = QHBoxLayout()
         cam_scale_layout.addWidget(QLabel("Cam Icon Size:"))
         self.slider_cam_scale = QSlider(Qt.Horizontal)
@@ -1750,6 +1767,7 @@ class SolveViewport(QWidget):
         self.camera_linesets = []
         
         self.origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0)
+        self.origin_scale = 5.0
         self.grid = self.create_grid(size=100, divisions=100)
         self.vis.add_geometry(self.origin_frame)
         self.vis.add_geometry(self.grid)
@@ -1897,7 +1915,52 @@ class SolveViewport(QWidget):
                 ls.colors = o3d.utility.Vector3dVector([[0.2, 0.2, 0.2] for _ in range(8)])
             self.vis.update_geometry(ls)
             
+        if hasattr(self, 'combo_perspective') and self.combo_perspective.currentText() == "Scene Camera":
+            self.sync_perspective_to_camera(idx)
+            
         self.activeCameraChanged.emit(idx)
+        
+    def update_perspective(self):
+        if self.combo_perspective.currentText() == "Scene Camera":
+            self.sync_perspective_to_camera()
+            
+    def sync_perspective_to_camera(self, idx=None):
+        if idx is None:
+            idx = self.slider_frame.value()
+        if not hasattr(self, 'cameras_rot') or idx >= len(self.cameras_rot): return
+        if not hasattr(self, 'camera_setup_data'): return
+        
+        R = self.cameras_rot[idx]
+        T = self.cameras_trans[idx]
+        
+        if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)):
+            return
+            
+        plate_w = self.camera_setup_data.get('plate_width', 1920)
+        plate_h = self.camera_setup_data.get('plate_height', 1080)
+        cx, cy = plate_w / 2.0, plate_h / 2.0
+        fx = fy = self.focal_px
+        
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            width=int(plate_w), height=int(plate_h), fx=fx, fy=fy, cx=cx, cy=cy
+        )
+        
+        cam_params = o3d.camera.PinholeCameraParameters()
+        cam_params.intrinsic = intrinsic
+        
+        extrinsic = np.eye(4)
+        extrinsic[:3, :3] = R
+        extrinsic[:3, 3] = T
+        cam_params.extrinsic = extrinsic
+        
+        view_ctl = self.vis.get_view_control()
+        view_ctl.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
+
+    def update_origin_scale(self):
+        self.origin_scale = self.slider_origin_scale.value() / 10.0
+        self.vis.remove_geometry(self.origin_frame, reset_bounding_box=False)
+        self.origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=self.origin_scale)
+        self.vis.add_geometry(self.origin_frame, reset_bounding_box=False)
         
     def update_error_threshold(self):
         if self.pcd is None or self.full_points is None: return
