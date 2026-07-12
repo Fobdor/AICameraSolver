@@ -1968,22 +1968,17 @@ class SolveViewport(QWidget):
         if win_w <= 0 or win_h <= 0:
             win_w, win_h = 800, 600
             
-        win_aspect = win_w / float(win_h)
-        plate_aspect = plate_w / float(plate_h)
-        
-        if win_aspect > plate_aspect:
-            fake_h = plate_h
-            fake_w = fake_h * win_aspect
-        else:
-            fake_w = plate_w
-            fake_h = fake_w / win_aspect
-            
-        cx = fake_w / 2.0
-        cy = fake_h / 2.0
-        fx = fy = self.focal_px
+        # Scale focal length to window dimensions to preserve FOV
+        # focal_px was calibrated against plate_w x plate_h
+        scale_x = win_w / float(plate_w)
+        scale_y = win_h / float(plate_h)
+        fx = self.focal_px * scale_x
+        fy = self.focal_px * scale_y
+        cx = win_w / 2.0
+        cy = win_h / 2.0
         
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
-            width=int(fake_w), height=int(fake_h), fx=fx, fy=fy, cx=cx, cy=cy
+            width=int(win_w), height=int(win_h), fx=fx, fy=fy, cx=cx, cy=cy
         )
         
         cam_params = o3d.camera.PinholeCameraParameters()
@@ -2379,22 +2374,17 @@ class ProxyGeoViewport(QWidget):
         if win_w <= 0 or win_h <= 0:
             win_w, win_h = 800, 600
             
-        win_aspect = win_w / float(win_h)
-        plate_aspect = plate_w / float(plate_h)
-        
-        if win_aspect > plate_aspect:
-            fake_h = plate_h
-            fake_w = fake_h * win_aspect
-        else:
-            fake_w = plate_w
-            fake_h = fake_w / win_aspect
-            
-        cx = fake_w / 2.0
-        cy = fake_h / 2.0
-        fx = fy = self.focal_px
+        # Scale focal length to window dimensions to preserve FOV
+        # focal_px was calibrated against plate_w x plate_h
+        scale_x = win_w / float(plate_w)
+        scale_y = win_h / float(plate_h)
+        fx = self.focal_px * scale_x
+        fy = self.focal_px * scale_y
+        cx = win_w / 2.0
+        cy = win_h / 2.0
         
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
-            width=int(fake_w), height=int(fake_h), fx=fx, fy=fy, cx=cx, cy=cy
+            width=int(win_w), height=int(win_h), fx=fx, fy=fy, cx=cx, cy=cy
         )
         
         cam_params = o3d.camera.PinholeCameraParameters()
