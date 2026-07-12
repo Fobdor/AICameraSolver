@@ -2155,6 +2155,7 @@ class ProxyGeoViewport(QWidget):
         self.control_layout.addWidget(QLabel("Perspective:"))
         self.combo_perspective = QComboBox()
         self.combo_perspective.addItems(["Free Camera", "Scene Camera"])
+        self.combo_perspective.setCurrentIndex(1) # Default to Scene Camera
         self.combo_perspective.currentIndexChanged.connect(self.update_perspective)
         self.control_layout.addWidget(self.combo_perspective)
         
