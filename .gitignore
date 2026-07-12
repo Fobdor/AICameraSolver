@@ -1,15 +1,6 @@
 # Environments
-# python/ <- We now track the base python runtime, but ignore heavy site-packages
-python/Lib/site-packages/*
-python/Scripts/*
-python/share/*
-python/etc/*
-!python/Lib/site-packages/pip/
-!python/Lib/site-packages/pip-*/
-!python/Lib/site-packages/setuptools/
-!python/Lib/site-packages/setuptools-*/
-!python/Lib/site-packages/pkg_resources/
-!python/Scripts/pip*.exe
+# Environments
+python/
 
 .env
 .venv/

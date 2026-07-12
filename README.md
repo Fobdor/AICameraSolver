@@ -17,9 +17,7 @@ It runs locally with a fully embedded, isolated Python runtime to avoid dependen
 
 ## Installation 
 
-This repository ships with a fully functional, lightweight Embedded Python runtime (`python/python.exe`). You **do not** need to install Python on your system, and this software will not interfere with any existing Python environments you have.
-
-To set up the software, you simply need to clone the repository and tell the embedded Python interpreter to download the heavy AI libraries.
+This repository provides automated installation scripts for Windows, Mac, and Linux. These scripts create isolated Python environments so that this software will not interfere with any existing Python environments on your system.
 
 ### 1. Clone the Repository
 Open your terminal or command prompt and run:
@@ -28,17 +26,35 @@ git clone https://github.com/Fobdor/AICameraSolver.git
 cd AICameraSolver
 ```
 
-### 2. Install Dependencies (Into Embedded Python)
-To install the required AI models and packages (like PyTorch, Open3D, and OpenCV), you must use the embedded Python executable included in the repo. 
+### 2. Install Dependencies
+To install the required AI models and packages (like PyTorch, Open3D, and OpenCV), simply run the automated setup script for your OS. This will download everything into a local, isolated environment.
 
-Run the following command from the root of the project:
+**On Windows:**
+Double-click `install.bat` or run:
 ```bat
-.\python\python.exe -m pip install -r requirements.txt
+.\install.bat
 ```
-*(Note: This download will be several gigabytes in size.)*
+*(This automatically downloads an isolated Embedded Python runtime and installs the dependencies).*
+
+**On Mac / Linux:**
+Run the install script from your terminal:
+```bash
+chmod +x install.sh
+./install.sh
+```
+*(This creates an isolated virtual environment (`venv`) using your system's Python 3 and installs the dependencies).*
 
 ### 3. Run the Application
-Once the installation finishes, you can launch the application by simply double-clicking the `launch.bat` file, or running:
+Once the installation finishes, you can launch the application:
+
+**On Windows:**
+Double-click `launch.bat` or run:
 ```bat
 .\launch.bat
+```
+
+**On Mac / Linux:**
+```bash
+chmod +x launch.sh
+./launch.sh
 ```
