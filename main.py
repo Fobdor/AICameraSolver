@@ -2144,9 +2144,31 @@ class ProxyGeoViewport(QWidget):
         self.mesh = None
         
         self.origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0)
+        self.origin_scale = 5.0
         self.grid = self.create_grid(size=100, divisions=100)
         self.vis.add_geometry(self.origin_frame)
         self.vis.add_geometry(self.grid)
+        
+        self.control_panel = QWidget()
+        self.control_layout = QHBoxLayout(self.control_panel)
+        
+        self.control_layout.addWidget(QLabel("Perspective:"))
+        self.combo_perspective = QComboBox()
+        self.combo_perspective.addItems(["Free Camera", "Scene Camera"])
+        self.combo_perspective.currentIndexChanged.connect(self.update_perspective)
+        self.control_layout.addWidget(self.combo_perspective)
+        
+        self.control_layout.addWidget(QLabel("Origin Axis Size:"))
+        self.slider_origin_scale = QSlider(Qt.Horizontal)
+        self.slider_origin_scale.setRange(1, 200)
+        self.slider_origin_scale.setValue(50)
+        self.slider_origin_scale.valueChanged.connect(self.update_origin_scale)
+        self.control_layout.addWidget(self.slider_origin_scale)
+        
+        self.control_layout.addStretch()
+        self.layout.addWidget(self.control_panel)
+        
+        self.current_idx = 0
         
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick_o3d)
@@ -2195,8 +2217,10 @@ class ProxyGeoViewport(QWidget):
         data = np.load(data_path)
         points_3d = data['points_3d']
         points_mask = data['points_mask']
-        cameras_rot = data['cameras_rot']
-        cameras_trans = data['cameras_trans']
+        self.cameras_rot = data['cameras_rot']
+        self.cameras_trans = data['cameras_trans']
+        self.focal_px = float(data['focal_px'])
+        self.proxy_res = proxy_res
         
         valid_pts = points_3d[points_mask]
         if len(valid_pts) > 0:
@@ -2206,9 +2230,9 @@ class ProxyGeoViewport(QWidget):
             self.vis.add_geometry(self.point_cloud)
             
         self.camera_linesets = []
-        for i in range(len(cameras_rot)):
-            R = cameras_rot[i]
-            T = cameras_trans[i]
+        for i in range(len(self.cameras_rot)):
+            R = self.cameras_rot[i]
+            T = self.cameras_trans[i]
             if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)): continue
             
             ls = o3d.geometry.LineSet()
@@ -2230,9 +2254,9 @@ class ProxyGeoViewport(QWidget):
         frustum_pts = np.array([[0,0,0], [x_min,y_min,z], [x_max,y_min,z], [x_max,y_max,z], [x_min,y_max,z]])
         
         idx = 0
-        for i in range(len(cameras_rot)):
-            R = cameras_rot[i]
-            T = cameras_trans[i]
+        for i in range(len(self.cameras_rot)):
+            R = self.cameras_rot[i]
+            T = self.cameras_trans[i]
             if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)): continue
             R_inv = R.T
             cam_center = -R_inv @ T
@@ -2248,6 +2272,65 @@ class ProxyGeoViewport(QWidget):
         vc.set_zoom(0.8)
         self.vis.poll_events()
         self.vis.update_renderer()
+
+    def update_active_camera(self, idx):
+        self.current_idx = idx
+        if not self.camera_linesets: return
+        
+        camera_idx = 0
+        for i in range(len(self.cameras_rot)):
+            R = self.cameras_rot[i]
+            T = self.cameras_trans[i]
+            if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)): continue
+            
+            ls = self.camera_linesets[camera_idx]
+            if i == idx:
+                ls.colors = o3d.utility.Vector3dVector(np.tile([0.0, 1.0, 0.0], (8, 1))) # Green for active
+            else:
+                ls.colors = o3d.utility.Vector3dVector(np.tile([1.0, 0.5, 0.0], (8, 1))) # Orange for inactive
+            self.vis.update_geometry(ls)
+            camera_idx += 1
+            
+        if hasattr(self, 'combo_perspective') and self.combo_perspective.currentText() == "Scene Camera":
+            self.sync_perspective_to_camera(idx)
+            
+    def update_perspective(self):
+        if self.combo_perspective.currentText() == "Scene Camera":
+            self.sync_perspective_to_camera(self.current_idx)
+            
+    def sync_perspective_to_camera(self, idx):
+        if not hasattr(self, 'cameras_rot') or idx >= len(self.cameras_rot): return
+        
+        R = self.cameras_rot[idx]
+        T = self.cameras_trans[idx]
+        
+        if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)):
+            return
+            
+        plate_w, plate_h = self.proxy_res, self.proxy_res * 9 / 16
+        cx, cy = plate_w / 2, plate_h / 2
+        fx = fy = self.focal_px
+        
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            width=int(plate_w), height=int(plate_h), fx=fx, fy=fy, cx=cx, cy=cy
+        )
+        
+        cam_params = o3d.camera.PinholeCameraParameters()
+        cam_params.intrinsic = intrinsic
+        
+        extrinsic = np.eye(4)
+        extrinsic[:3, :3] = R
+        extrinsic[:3, 3] = T
+        cam_params.extrinsic = extrinsic
+        
+        view_ctl = self.vis.get_view_control()
+        view_ctl.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
+
+    def update_origin_scale(self):
+        self.origin_scale = self.slider_origin_scale.value() / 10.0
+        self.vis.remove_geometry(self.origin_frame, reset_bounding_box=False)
+        self.origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=self.origin_scale)
+        self.vis.add_geometry(self.origin_frame, reset_bounding_box=False)
 
     def load_proxy_mesh(self, mesh_path):
         if self.mesh:
@@ -3215,6 +3298,7 @@ class MainWindow(QMainWindow):
         
         self.proxy_geo_2d_viewport = SequenceViewerWidget(self, interactive=False, show_tracks=False)
         self.proxy_geo_3d_viewport = ProxyGeoViewport()
+        self.proxy_geo_2d_viewport.slider.valueChanged.connect(self.proxy_geo_3d_viewport.update_active_camera)
         
         self.proxy_geo_splitter.addWidget(self.proxy_geo_2d_viewport)
         self.proxy_geo_splitter.addWidget(self.proxy_geo_3d_viewport)
