@@ -1907,6 +1907,8 @@ class SolveViewport(QWidget):
             self.vis.reset_view_point(True)
         elif view_ctl is not None and cam_params is not None:
             view_ctl.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
+            
+        self.update_perspective()
         
     def update_active_camera(self):
         if not self.camera_linesets: return
@@ -2293,6 +2295,8 @@ class ProxyGeoViewport(QWidget):
         vc.set_zoom(0.8)
         self.vis.poll_events()
         self.vis.update_renderer()
+        
+        self.update_perspective()
 
     def update_active_camera(self, idx):
         self.current_idx = idx
