@@ -2,6 +2,8 @@
 # python/ <- We now track the base python runtime, but ignore heavy site-packages
 python/Lib/site-packages/*
 python/Scripts/*
+python/share/*
+python/etc/*
 !python/Lib/site-packages/pip/
 !python/Lib/site-packages/pip-*/
 !python/Lib/site-packages/setuptools/
@@ -19,7 +21,7 @@ venv.bak/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
-*.py[cod]
+*.py[co]
 *$py.class
 
 # PyInstaller
