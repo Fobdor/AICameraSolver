@@ -1531,33 +1531,33 @@ class ProxyGeneratorWorker(QThread):
                 inp.close()
                 return i, (native_w, native_h)
 
-                # Intelligently scale workers based on System RAM and CPU threads
-                import ctypes
-                class MEMORYSTATUSEX(ctypes.Structure):
-                    _fields_ = [
-                        ("dwLength", ctypes.c_ulong),
-                        ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong),
-                        ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong),
-                        ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong),
-                        ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-                    ]
-                stat = MEMORYSTATUSEX()
-                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-                
-                total_ram_gb = stat.ullTotalPhys / (1024**3)
-                
-                # Budget ~1.5 GB of system RAM per concurrent worker to prevent OOM crashes on 4K EXRs
-                max_workers_by_ram = max(1, int(total_ram_gb / 1.5))
-                cpu_threads = os.cpu_count() or 4
-                
-                safe_workers = max(1, min(cpu_threads, max_workers_by_ram, 64))
-                
-                with concurrent.futures.ThreadPoolExecutor(max_workers=safe_workers) as executor:
+            # Intelligently scale workers based on System RAM and CPU threads
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            
+            total_ram_gb = stat.ullTotalPhys / (1024**3)
+            
+            # Budget ~1.5 GB of system RAM per concurrent worker to prevent OOM crashes on 4K EXRs
+            max_workers_by_ram = max(1, int(total_ram_gb / 1.5))
+            cpu_threads = os.cpu_count() or 4
+            
+            safe_workers = max(1, min(cpu_threads, max_workers_by_ram, 64))
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=safe_workers) as executor:
                 futures = {executor.submit(process_frame, i, path): i for i, path in enumerate(self.exr_files)}
                 completed = 0
                 for future in concurrent.futures.as_completed(futures):
