@@ -2224,7 +2224,7 @@ class ProxyGeoViewport(QWidget):
         self.vis.poll_events()
         self.vis.update_renderer()
 
-    def load_solve_data(self, data_path, proxy_res):
+    def load_solve_data(self, data_path, proxy_res, camera_setup_data):
         if self.point_cloud:
             self.vis.remove_geometry(self.point_cloud)
         for ls in self.camera_linesets:
@@ -2243,7 +2243,8 @@ class ProxyGeoViewport(QWidget):
         self.cameras_rot = data['cameras_rot']
         self.cameras_trans = data['cameras_trans']
         self.focal_px = float(data['focal_px'])
-        self.proxy_res = proxy_res
+        self.plate_w = camera_setup_data.get('plate_width', 1920)
+        self.plate_h = camera_setup_data.get('plate_height', 1080)
         
         valid_pts = points_3d[points_mask]
         if len(valid_pts) > 0:
@@ -2267,9 +2268,17 @@ class ProxyGeoViewport(QWidget):
             self.vis.add_geometry(ls)
             
         focal_px = float(data['focal_px'])
-        plate_w, plate_h = proxy_res, proxy_res * 9 / 16
+        plate_w, plate_h = self.plate_w, self.plate_h
         cx, cy = plate_w / 2, plate_h / 2
-        z = 0.5
+        
+        if len(valid_pts) > 0:
+            min_bound = np.min(valid_pts, axis=0)
+            max_bound = np.max(valid_pts, axis=0)
+            max_extent = np.max(max_bound - min_bound)
+        else:
+            max_extent = 10.0
+            
+        z = max_extent * 0.05
         x_max = (plate_w - cx) / focal_px * z
         x_min = (0 - cx) / focal_px * z
         y_max = (plate_h - cy) / focal_px * z
@@ -2342,7 +2351,7 @@ class ProxyGeoViewport(QWidget):
         if np.allclose(R, np.eye(3)) and np.allclose(T, np.zeros(3)):
             return
             
-        plate_w, plate_h = self.proxy_res, self.proxy_res * 9 / 16
+        plate_w, plate_h = self.plate_w, self.plate_h
         cx, cy = plate_w / 2, plate_h / 2
         fx = fy = self.focal_px
         
@@ -4391,7 +4400,7 @@ class MainWindow(QMainWindow):
             if self.project_dir:
                 solve_path = os.path.join(self.project_dir, 'solve_data.npz')
                 if os.path.exists(solve_path):
-                    self.proxy_geo_3d_viewport.load_solve_data(solve_path, self.proxy_res)
+                    self.proxy_geo_3d_viewport.load_solve_data(solve_path, self.proxy_res, self.camera_setup_data)
                 mesh_path = os.path.join(self.project_dir, 'proxy_geo.obj')
                 if os.path.exists(mesh_path):
                     self.proxy_geo_3d_viewport.load_proxy_mesh(mesh_path)
