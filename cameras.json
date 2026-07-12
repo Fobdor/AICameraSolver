@@ -91,13 +91,34 @@
       "sensor_width_mm": 35.60,
       "sensor_height_mm": 23.80
     },
-    {
-      "make": "Sony",
-      "model": "a1 / a7R V / a7 IV",
-      "format": "Full Frame",
+	{
+	  "make": "Sony",
+      "model": "a7 IV (Full Frame 4K - 16:9)",
+      "format": "Full Frame 16:9",
       "sensor_width_mm": 35.90,
-      "sensor_height_mm": 24.00
-    },
+      "sensor_height_mm": 20.19
+	},
+	{
+      "make": "Sony",
+      "model": "a7 IV (Full Frame HD - 16:9)",
+      "format": "Full Frame 16:9",
+      "sensor_width_mm": 35.90,
+      "sensor_height_mm": 20.19
+	},
+	{
+      "make": "Sony",
+      "model": "a7 IV (APS-C 4K - 16:9)",
+      "format": "Super 35 / APS-C 16:9",
+      "sensor_width_mm": 23.60,
+      "sensor_height_mm": 13.27
+	},
+	{
+      "make": "Sony",
+      "model": "a7 IV (APS-C HD - 16:9)",
+      "format": "Super 35 / APS-C 16:9",
+	  "sensor_width_mm": 23.60,
+      "sensor_height_mm": 13.27
+	},
     {
       "make": "Canon",
       "model": "C500 Mark II",
