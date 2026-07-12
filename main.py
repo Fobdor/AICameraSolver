@@ -1963,22 +1963,24 @@ class SolveViewport(QWidget):
         plate_w = self.camera_setup_data.get('plate_width', 1920)
         plate_h = self.camera_setup_data.get('plate_height', 1080)
         
-        win_w = self.widget3d.width() if hasattr(self, 'widget3d') else 800
-        win_h = self.widget3d.height() if hasattr(self, 'widget3d') else 600
-        if win_w <= 0 or win_h <= 0:
-            win_w, win_h = 800, 600
+        # Query Open3D's own render dimensions (handles DPI scaling correctly)
+        view_ctl = self.vis.get_view_control()
+        current_params = view_ctl.convert_to_pinhole_camera_parameters()
+        render_w = current_params.intrinsic.width
+        render_h = current_params.intrinsic.height
+        if render_w <= 0 or render_h <= 0:
+            render_w, render_h = 800, 600
             
-        # Scale focal length to window dimensions to preserve FOV
-        # focal_px was calibrated against plate_w x plate_h
-        scale_x = win_w / float(plate_w)
-        scale_y = win_h / float(plate_h)
+        # Scale focal length to render dimensions to preserve FOV
+        scale_x = render_w / float(plate_w)
+        scale_y = render_h / float(plate_h)
         fx = self.focal_px * scale_x
         fy = self.focal_px * scale_y
-        cx = win_w / 2.0
-        cy = win_h / 2.0
+        cx = render_w / 2.0
+        cy = render_h / 2.0
         
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
-            width=int(win_w), height=int(win_h), fx=fx, fy=fy, cx=cx, cy=cy
+            width=render_w, height=render_h, fx=fx, fy=fy, cx=cx, cy=cy
         )
         
         cam_params = o3d.camera.PinholeCameraParameters()
@@ -1989,7 +1991,6 @@ class SolveViewport(QWidget):
         extrinsic[:3, 3] = T
         cam_params.extrinsic = extrinsic
         
-        view_ctl = self.vis.get_view_control()
         view_ctl.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
 
     def update_origin_scale(self):
@@ -2369,22 +2370,24 @@ class ProxyGeoViewport(QWidget):
             
         plate_w, plate_h = self.plate_w, self.plate_h
         
-        win_w = self.widget3d.width() if hasattr(self, 'widget3d') else 800
-        win_h = self.widget3d.height() if hasattr(self, 'widget3d') else 600
-        if win_w <= 0 or win_h <= 0:
-            win_w, win_h = 800, 600
+        # Query Open3D's own render dimensions (handles DPI scaling correctly)
+        view_ctl = self.vis.get_view_control()
+        current_params = view_ctl.convert_to_pinhole_camera_parameters()
+        render_w = current_params.intrinsic.width
+        render_h = current_params.intrinsic.height
+        if render_w <= 0 or render_h <= 0:
+            render_w, render_h = 800, 600
             
-        # Scale focal length to window dimensions to preserve FOV
-        # focal_px was calibrated against plate_w x plate_h
-        scale_x = win_w / float(plate_w)
-        scale_y = win_h / float(plate_h)
+        # Scale focal length to render dimensions to preserve FOV
+        scale_x = render_w / float(plate_w)
+        scale_y = render_h / float(plate_h)
         fx = self.focal_px * scale_x
         fy = self.focal_px * scale_y
-        cx = win_w / 2.0
-        cy = win_h / 2.0
+        cx = render_w / 2.0
+        cy = render_h / 2.0
         
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
-            width=int(win_w), height=int(win_h), fx=fx, fy=fy, cx=cx, cy=cy
+            width=render_w, height=render_h, fx=fx, fy=fy, cx=cx, cy=cy
         )
         
         cam_params = o3d.camera.PinholeCameraParameters()
@@ -2395,7 +2398,6 @@ class ProxyGeoViewport(QWidget):
         extrinsic[:3, 3] = T
         cam_params.extrinsic = extrinsic
         
-        view_ctl = self.vis.get_view_control()
         view_ctl.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
 
     def update_origin_scale(self):
