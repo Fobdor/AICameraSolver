@@ -2438,9 +2438,6 @@ class ProxyGeoViewport(QWidget):
             
         self.selected_tracks = old_selected
         self.update_selection_highlight()
-            self.vis.remove_geometry(mesh, reset_bounding_box=False)
-            self.vis.poll_events()
-            self.vis.update_renderer()
 
     def load_solve_data(self, data_path, proxy_res, camera_setup_data):
         if self.point_cloud:
@@ -4101,6 +4098,32 @@ class MainWindow(QMainWindow):
             self.proxy_patches_tracks.pop(row)
             self.save_proxy_patches()
             self.rebuild_proxy_patches_ui()
+
+    def rebuild_proxy_patches_ui(self):
+        self.list_proxy_patches.clear()
+        for idx, tracks in enumerate(self.proxy_patches_tracks):
+            patch_name = f"Patch {idx + 1} ({len(tracks)} vertices)"
+            self.list_proxy_patches.addItem(patch_name)
+
+    def save_proxy_patches(self):
+        if not self.project_dir: return
+        path = os.path.join(self.project_dir, 'proxy_patches.json')
+        with open(path, 'w') as f:
+            json.dump(self.proxy_patches_tracks, f)
+
+    def load_proxy_patches(self):
+        if not self.project_dir: return
+        path = os.path.join(self.project_dir, 'proxy_patches.json')
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    self.proxy_patches_tracks = json.load(f)
+            except:
+                self.proxy_patches_tracks = []
+        else:
+            self.proxy_patches_tracks = []
+            
+        self.rebuild_proxy_patches_ui()
 
     def clear_selection(self):
         self.selected_tracks = []
