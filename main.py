@@ -2489,9 +2489,9 @@ class ProxyGeoViewport(QWidget):
         plate_w, plate_h = self.plate_w, self.plate_h
         cx, cy = plate_w / 2, plate_h / 2
         
-        if len(valid_pts) > 0:
-            min_bound = np.min(valid_pts, axis=0)
-            max_bound = np.max(valid_pts, axis=0)
+        if len(self.full_points) > 0:
+            min_bound = np.min(self.full_points, axis=0)
+            max_bound = np.max(self.full_points, axis=0)
             max_extent = np.max(max_bound - min_bound)
         else:
             max_extent = 10.0
