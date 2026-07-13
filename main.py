@@ -1,5 +1,6 @@
 import sys
 import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import json
 import multiprocessing
 import time
@@ -17,11 +18,12 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QProgressBar, QLabel, 
                                QFileDialog, QTabWidget, QMessageBox, QGraphicsView,
                                QGraphicsScene, QSlider, QComboBox, QGroupBox, QGridLayout, QSpinBox,
-                               QInputDialog, QDialog, QCheckBox, QListWidget, QDoubleSpinBox)
+                               QInputDialog, QDialog, QCheckBox, QListWidget, QDoubleSpinBox, QRubberBand)
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QWindow
-from PySide6.QtCore import QTimer, Qt, QPointF, QThread, Signal
+from PySide6.QtCore import QTimer, Qt, QPointF, QPoint, QRect, QRectF, QSize, QThread, Signal
 import win32gui
 import open3d as o3d
+from solve_refine import SolveRefinementWorker
 
 # Directories
 MODELS_DIR = os.path.join(os.getcwd(), 'models')
@@ -276,6 +278,10 @@ class ClickableGraphicsView(QGraphicsView):
         super().__init__(scene)
         self.parent_widget = parent_widget
         self.setMouseTracking(True)
+        self.rubber_band = None
+        self.origin = QPoint()
+        self.is_selecting = False
+        self.select_mode = 1
 
     def mousePressEvent(self, event):
         if self.parent_widget.pixmap_item:
@@ -297,9 +303,19 @@ class ClickableGraphicsView(QGraphicsView):
                         y = int(y * scale_h)
 
                 if getattr(self.parent_widget, 'show_tracks', False):
-                    if event.button() == Qt.LeftButton and event.modifiers() == Qt.ShiftModifier:
-                        frame_idx = getattr(self.parent_widget, 'current_frame_idx', 0)
-                        self.parent_widget.pick_track(x, y, frame_idx)
+                    if event.button() == Qt.LeftButton:
+                        if event.modifiers() == Qt.ShiftModifier:
+                            frame_idx = getattr(self.parent_widget, 'current_frame_idx', 0)
+                            self.parent_widget.pick_track(x, y, frame_idx)
+                        elif event.modifiers() in (Qt.AltModifier, Qt.ControlModifier):
+                            self.origin = event.position().toPoint()
+                            if self.rubber_band is None:
+                                self.rubber_band = QRubberBand(QRubberBand.Rectangle, self)
+                            self.rubber_band.setGeometry(QRect(self.origin, QSize()))
+                            self.rubber_band.show()
+                            self.is_selecting = True
+                            self.select_mode = 1 if event.modifiers() == Qt.AltModifier else 0
+                            return
                 else:
                     obj_id = getattr(self.parent_widget, 'spin_obj', None)
                     obj_val = obj_id.value() if obj_id else 1
@@ -312,10 +328,32 @@ class ClickableGraphicsView(QGraphicsView):
                     
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event):
+        if self.is_selecting and self.rubber_band:
+            self.rubber_band.setGeometry(QRect(self.origin, event.position().toPoint()).normalized())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.is_selecting and self.rubber_band:
+            self.rubber_band.hide()
+            self.is_selecting = False
+            rect = self.rubber_band.geometry()
+            
+            if self.parent_widget.pixmap_item:
+                scene_rect = self.mapToScene(rect).boundingRect()
+                item_rect = self.parent_widget.pixmap_item.mapRectFromScene(scene_rect)
+                frame_idx = getattr(self.parent_widget, 'current_frame_idx', 0)
+                self.parent_widget.pick_tracks_in_rect(item_rect, frame_idx, self.select_mode)
+                
+            self.rubber_band = None
+            return
+        super().mouseReleaseEvent(event)
+
 class SequenceViewerWidget(QWidget):
     # Signals to communicate with MainWindow
     clicksUpdated = Signal(int) # emits frame_idx
     trackPicked = Signal(int) # emits track_id
+    trackPickedRect = Signal(list, int) # emits track_ids, mode
 
     def __init__(self, parent=None, interactive=False, show_tracks=False):
         super().__init__(parent)
@@ -494,6 +532,32 @@ class SequenceViewerWidget(QWidget):
         if dists[min_idx] < 20.0: # 20 pixels tolerance
             track_id = valid_indices[min_idx]
             self.trackPicked.emit(int(track_id))
+
+    def pick_tracks_in_rect(self, rect, frame_idx, mode):
+        if self.track_data is None or self.track_vis is None: return
+        if frame_idx >= self.track_data.shape[0]: return
+        
+        native_rect = QRectF(rect)
+        if self.native_size != (0,0):
+            proxy_w = self.pixmap_item.pixmap().width()
+            native_w, native_h = self.native_size
+            if proxy_w > 0 and proxy_w != native_w:
+                proxy_h = self.pixmap_item.pixmap().height()
+                scale_w = native_w / proxy_w
+                scale_h = native_h / proxy_h
+                native_rect = QRectF(rect.x() * scale_w, rect.y() * scale_h, rect.width() * scale_w, rect.height() * scale_h)
+                
+        x1, y1 = native_rect.left(), native_rect.top()
+        x2, y2 = native_rect.right(), native_rect.bottom()
+        
+        pts = self.track_data[frame_idx]
+        vis = self.track_vis[frame_idx]
+        
+        mask = vis & (pts[:, 0] >= x1) & (pts[:, 0] <= x2) & (pts[:, 1] >= y1) & (pts[:, 1] <= y2)
+        indices = np.where(mask)[0].tolist()
+        
+        if indices:
+            self.trackPickedRect.emit(indices, mode)
 
     def update_sequence(self, file_list, color_space, project_dir):
         self.exr_files = file_list
@@ -1625,6 +1689,7 @@ class SolveViewport(QWidget):
     reqDelConstraint = Signal(int)
     reqApplyOrientation = Signal()
     reqSelectConstraintIdx = Signal(int)
+    reqRefineSolve = Signal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1698,11 +1763,13 @@ class SolveViewport(QWidget):
             "Origin (1 pt)", 
             "Scale (2 pts)", 
             "Ground Plane (3+ pts)", 
+            "Horizontal Plane (3+ pts)",
             "XY Plane (2+ pts)", 
             "YZ Plane (2+ pts)", 
             "X Line (2 pts)", 
             "Y Line (2 pts)", 
-            "Z Line (2 pts)"
+            "Z Line (2 pts)",
+            "Coplanar Group (3+ pts)"
         ])
         row1.addWidget(self.combo_orient_type)
         
@@ -1727,6 +1794,11 @@ class SolveViewport(QWidget):
         self.btn_apply_orient.clicked.connect(self.reqApplyOrientation.emit)
         row2.addWidget(self.btn_apply_orient)
         self.control_layout.addLayout(row2)
+        
+        self.btn_refine_solve = QPushButton("Refine Solve (PyTorch)")
+        self.btn_refine_solve.setStyleSheet("font-weight: bold; color: #ffaa00;")
+        self.btn_refine_solve.clicked.connect(self.reqRefineSolve.emit)
+        self.control_layout.addWidget(self.btn_refine_solve)
         
         persp_layout = QHBoxLayout()
         persp_layout.addWidget(QLabel("Perspective:"))
@@ -3395,6 +3467,7 @@ class MainWindow(QMainWindow):
         self.solve_2d_viewport = SequenceViewerWidget(self, interactive=True, show_tracks=True)
         self.solve_2d_viewport.hide()
         self.solve_2d_viewport.trackPicked.connect(self.on_track_picked)
+        self.solve_2d_viewport.trackPickedRect.connect(self.on_tracks_picked_rect)
         
         self.solve_viewport = SolveViewport()
         self.solve_viewport.hide()
@@ -3413,6 +3486,7 @@ class MainWindow(QMainWindow):
         self.solve_viewport.reqDelConstraint.connect(self.del_orientation_constraint)
         self.solve_viewport.reqApplyOrientation.connect(self.apply_orientation_constraints)
         self.solve_viewport.reqSelectConstraintIdx.connect(self.select_orientation_constraint)
+        self.solve_viewport.reqRefineSolve.connect(self.refine_solve_with_constraints)
         
         self.selected_tracks = []
         self.orientation_constraints = []
@@ -3507,6 +3581,7 @@ class MainWindow(QMainWindow):
         
         self.proxy_geo_2d_viewport = SequenceViewerWidget(self, interactive=True, show_tracks=True)
         self.proxy_geo_2d_viewport.trackPicked.connect(self.on_proxy_track_picked)
+        self.proxy_geo_2d_viewport.trackPickedRect.connect(self.on_proxy_tracks_picked_rect)
         self.proxy_geo_3d_viewport = ProxyGeoViewport()
         self.proxy_geo_2d_viewport.slider.valueChanged.connect(self.proxy_geo_3d_viewport.update_active_camera)
         
@@ -3903,11 +3978,44 @@ class MainWindow(QMainWindow):
             print(f"Failed to load 2D solve data: {e}")
 
     def on_track_picked(self, track_id):
-        if track_id in self.selected_tracks:
-            self.selected_tracks.remove(track_id)
+        if not hasattr(self, 'active_constraint') or not self.active_constraint:
+            if track_id in self.selected_tracks:
+                self.selected_tracks.remove(track_id)
+            else:
+                self.selected_tracks.append(track_id)
+            self.update_selection_ui()
+            return
+        
+        tracks = self.active_constraint.setdefault('tracks', [])
+        if track_id in tracks:
+            tracks.remove(track_id)
         else:
-            self.selected_tracks.append(track_id)
+            tracks.append(track_id)
+            
+        self.selected_tracks = list(tracks)
         self.update_selection_ui()
+
+    def on_tracks_picked_rect(self, track_ids, mode):
+        if not hasattr(self, 'active_constraint') or not self.active_constraint:
+            for tid in track_ids:
+                if mode == 1:
+                    if tid not in self.selected_tracks: self.selected_tracks.append(tid)
+                else:
+                    if tid in self.selected_tracks: self.selected_tracks.remove(tid)
+            self.update_selection_ui()
+            self.update_proxy_selection_ui()
+            return
+        
+        tracks = self.active_constraint.setdefault('tracks', [])
+        for tid in track_ids:
+            if mode == 1:
+                if tid not in tracks: tracks.append(tid)
+            else:
+                if tid in tracks: tracks.remove(tid)
+                
+        self.selected_tracks = list(tracks)
+        self.update_selection_ui()
+        self.update_proxy_selection_ui()
 
     def on_proxy_track_picked(self, track_id):
         if not hasattr(self, 'proxy_selected_tracks'):
@@ -3916,6 +4024,16 @@ class MainWindow(QMainWindow):
             self.proxy_selected_tracks.remove(track_id)
         else:
             self.proxy_selected_tracks.append(track_id)
+        self.update_proxy_selection_ui()
+
+    def on_proxy_tracks_picked_rect(self, track_ids, mode):
+        if not hasattr(self, 'proxy_selected_tracks'):
+            self.proxy_selected_tracks = []
+        for tid in track_ids:
+            if mode == 1:
+                if tid not in self.proxy_selected_tracks: self.proxy_selected_tracks.append(tid)
+            else:
+                if tid in self.proxy_selected_tracks: self.proxy_selected_tracks.remove(tid)
         self.update_proxy_selection_ui()
         
     def update_proxy_selection_ui(self):
@@ -4004,7 +4122,7 @@ class MainWindow(QMainWindow):
         self.solve_2d_viewport.track_colors = colors
         
         # Redraw current frame
-        current_frame = self.solve_viewport.slider_frame.value()
+        current_frame = self.solve_2d_viewport.slider.value()
         self.solve_2d_viewport.on_frame_changed(current_frame)
 
     def load_orientation_constraints(self):
@@ -4063,6 +4181,10 @@ class MainWindow(QMainWindow):
             if any(c['type'] == ctype for c in self.orientation_constraints):
                 QMessageBox.warning(self, "Warning", "Only one Ground Plane constraint is allowed.")
                 return
+                
+        if ctype == "Coplanar Group (3+ pts)" and len(self.selected_tracks) < 3:
+            QMessageBox.warning(self, "Warning", "Select at least 3 tracks for Coplanar Group.")
+            return
         elif "Plane" in ctype:
             if len(tracks) < 2:
                 QMessageBox.warning(self, "Warning", f"{ctype} requires 2 or more points.")
@@ -4133,7 +4255,7 @@ class MainWindow(QMainWindow):
             if not has_scale:
                 s = 1.0
                 
-            has_rot = any(c['type'] not in ["Origin (1 pt)", "Scale (2 pts)"] for c in self.orientation_constraints)
+            has_rot = any(c['type'] not in ["Origin (1 pt)", "Scale (2 pts)", "Coplanar Group (3+ pts)"] for c in self.orientation_constraints)
             if not has_rot:
                 r = np.zeros(3)
                 
@@ -4156,6 +4278,7 @@ class MainWindow(QMainWindow):
             
             res = []
             for c in self.orientation_constraints:
+                if c['type'] == "Coplanar Group (3+ pts)": continue
                 tracks = c['tracks']
                 ctype = c['type']
                 
@@ -4173,6 +4296,9 @@ class MainWindow(QMainWindow):
                     res.append(dist - c['scale_dist'])
                 elif ctype == "Ground Plane (3+ pts)" or ctype == "XZ Plane (2+ pts)":
                     res.extend(P_t[:, 1].tolist())
+                elif ctype == "Horizontal Plane (3+ pts)":
+                    avg_y = np.mean(P_t[:, 1])
+                    res.extend((P_t[:, 1] - avg_y).tolist())
                 elif ctype == "XY Plane (2+ pts)":
                     res.extend(P_t[:, 2].tolist())
                 elif ctype == "YZ Plane (2+ pts)":
@@ -4331,6 +4457,43 @@ class MainWindow(QMainWindow):
         with open(self.project_file, 'w') as f:
             json.dump(data, f, indent=4)
             
+    def refine_solve_with_constraints(self):
+        if not hasattr(self, 'project_dir') or not self.project_dir: return
+        if not hasattr(self, 'camera_setup_data'): self.camera_setup_data = {}
+        
+        self.lbl_solve_status.show()
+        self.lbl_solve_status.setText("Refining solve (PyTorch BA)...")
+        self.solve_progress.setValue(0)
+        self.solve_progress.show()
+        if hasattr(self.solve_viewport, 'btn_start_solve'):
+            self.solve_viewport.btn_start_solve.setEnabled(False)
+        self.solve_viewport.btn_refine_solve.setEnabled(False)
+        self.solve_viewport.btn_apply_orient.setEnabled(False)
+        
+        self.refine_worker = SolveRefinementWorker(self.project_dir, self.orientation_constraints, self.camera_setup_data)
+        self.refine_worker.progress.connect(self.on_refine_progress)
+        self.refine_worker.finished.connect(self.on_refine_finished)
+        self.refine_worker.start()
+
+    def on_refine_progress(self, val, msg):
+        self.solve_progress.setValue(val)
+        self.lbl_solve_status.setText(msg)
+
+    def on_refine_finished(self, success, msg):
+        if hasattr(self.solve_viewport, 'btn_start_solve'):
+            self.solve_viewport.btn_start_solve.setEnabled(True)
+        self.solve_viewport.btn_refine_solve.setEnabled(True)
+        self.solve_viewport.btn_apply_orient.setEnabled(True)
+        
+        if success:
+            self.lbl_solve_status.setText("Refinement Complete!")
+            self.solve_progress.setValue(100)
+            self.apply_orientation_constraints(reset_view=True)
+            QMessageBox.information(self, "Success", "PyTorch Bundle Adjustment refinement complete!")
+        else:
+            self.lbl_solve_status.setText("Refinement Failed")
+            QMessageBox.critical(self, "Error", f"Refinement failed:\n{msg}")
+
     def load_project(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Project File", "", "JSON (*.json)")
         if not file_path: return
