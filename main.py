@@ -4581,15 +4581,16 @@ class MainWindow(QMainWindow):
             self.btn_gen_depth.setEnabled(True)
             self.lbl_file.setText(f"Project: {self.project_root} | Frames: {len(self.exr_files)}")
             
+            self.load_orientation_constraints()
+            self.load_proxy_patches()
+
             if hasattr(self, 'solve_viewport'):
                 out_data_path = os.path.join(self.project_dir, 'solve_data.npz')
-                if os.path.exists(out_data_path) and self.camera_setup_data:
+                if os.path.exists(out_data_path):
                     self.solve_2d_viewport.show()
                     self.solve_viewport.show()
                     self.solve_viewport.load_solve_data(out_data_path, self.camera_setup_data)
                     self.load_2d_solve_data(out_data_path)
-                    self.load_orientation_constraints()
-                    self.load_proxy_patches()
                     self.solve_progress.hide()
                     self.btn_start_solve.setText("Re-Start 3D Solver (Overwrite)")
                     self.lbl_solve_status.hide()
