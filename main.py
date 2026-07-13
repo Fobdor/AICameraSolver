@@ -713,14 +713,14 @@ def persistent_worker_daemon(cmd_queue, res_queue, exr_files, project_dir, nativ
     if torch and torch.cuda.is_available():
         print(f"[Daemon] Loading real SAM 2 model weights into VRAM...", flush=True)
         try:
-            from hydra import initialize_config_module, core
-            core.global_hydra.GlobalHydra.instance().clear()
-            initialize_config_module("sam2.configs", version_base="1.2")
             from sam2.build_sam import build_sam2_video_predictor
             
             ckpt_path = os.path.join(MODELS_DIR, "sam2_hiera_large.pt")
             if os.path.exists(ckpt_path):
-                sam_model = build_sam2_video_predictor("sam2/sam2_hiera_l.yaml", ckpt_path, device=device)
+                try:
+                    sam_model = build_sam2_video_predictor("sam2_hiera_l.yaml", ckpt_path, device=device)
+                except:
+                    sam_model = build_sam2_video_predictor("sam2/sam2_hiera_l.yaml", ckpt_path, device=device)
             else:
                 raise FileNotFoundError("SAM 2 weights not found.")
         except Exception as e:
