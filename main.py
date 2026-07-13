@@ -2242,6 +2242,7 @@ class ProxyGeoViewport(QWidget):
         opt = self.vis.get_render_option()
         opt.background_color = np.asarray([0, 0, 0])
         opt.point_size = 2.0
+        opt.mesh_show_back_face = True
         
         for _ in range(10):
             self.vis.poll_events()
@@ -2420,6 +2421,23 @@ class ProxyGeoViewport(QWidget):
         if 0 <= idx < len(self.user_patches_meshes):
             mesh = self.user_patches_meshes.pop(idx)
             self.user_patches.pop(idx)
+            self.vis.remove_geometry(mesh, reset_bounding_box=False)
+            self.vis.poll_events()
+            self.vis.update_renderer()
+
+    def rebuild_patches(self, patches_tracks_list):
+        for mesh in self.user_patches_meshes:
+            self.vis.remove_geometry(mesh, reset_bounding_box=False)
+        self.user_patches = []
+        self.user_patches_meshes = []
+        
+        old_selected = self.selected_tracks
+        for tracks in patches_tracks_list:
+            self.selected_tracks = tracks
+            self.create_patch_from_selection()
+            
+        self.selected_tracks = old_selected
+        self.update_selection_highlight()
             self.vis.remove_geometry(mesh, reset_bounding_box=False)
             self.vis.poll_events()
             self.vis.update_renderer()
@@ -3024,6 +3042,7 @@ class MainWindow(QMainWindow):
         self.color_space = CS_LINEAR_SRGB
         self.proxy_res = 1536
         self.native_sizes = []
+        self.proxy_patches_tracks = []
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -4061,16 +4080,12 @@ class MainWindow(QMainWindow):
 
     def create_proxy_patch(self):
         if not hasattr(self, 'proxy_selected_tracks') or not self.proxy_selected_tracks:
-            QMessageBox.warning(self, "Warning", "No points selected.")
             return
-        if len(self.proxy_selected_tracks) < 3:
-            QMessageBox.warning(self, "Warning", "Select at least 3 points.")
-            return
-            
         success = self.proxy_geo_3d_viewport.create_patch_from_selection()
         if success:
-            patch_name = f"Patch {self.list_proxy_patches.count() + 1} ({len(self.proxy_selected_tracks)} vertices)"
-            self.list_proxy_patches.addItem(patch_name)
+            self.proxy_patches_tracks.append(list(self.proxy_selected_tracks))
+            self.save_proxy_patches()
+            self.rebuild_proxy_patches_ui()
             self.clear_proxy_selection()
         else:
             QMessageBox.critical(self, "Error", "Failed to triangulate points.")
@@ -4081,9 +4096,12 @@ class MainWindow(QMainWindow):
 
     def delete_proxy_patch(self):
         row = self.list_proxy_patches.currentRow()
-        if row >= 0:
+        if row >= 0 and row < len(self.proxy_patches_tracks):
             self.proxy_geo_3d_viewport.delete_patch(row)
-            self.list_proxy_patches.takeItem(row)
+            self.proxy_patches_tracks.pop(row)
+            self.save_proxy_patches()
+            self.rebuild_proxy_patches_ui()
+
     def clear_selection(self):
         self.selected_tracks = []
         self.active_constraint = None
@@ -4548,6 +4566,7 @@ class MainWindow(QMainWindow):
                     self.solve_viewport.load_solve_data(out_data_path, self.camera_setup_data)
                     self.load_2d_solve_data(out_data_path)
                     self.load_orientation_constraints()
+                    self.load_proxy_patches()
                     self.solve_progress.hide()
                     self.btn_start_solve.setText("Re-Start 3D Solver (Overwrite)")
                     self.lbl_solve_status.hide()
@@ -4792,6 +4811,7 @@ class MainWindow(QMainWindow):
                 if os.path.exists(solve_path):
                     self.load_2d_solve_data(solve_path)
                     self.proxy_geo_3d_viewport.load_solve_data(solve_path, self.proxy_res, self.camera_setup_data)
+                    self.proxy_geo_3d_viewport.rebuild_patches(self.proxy_patches_tracks)
                 else:
                     self.proxy_geo_2d_viewport.update_sequence(self.exr_files, getattr(self, 'color_space', CS_LINEAR_SRGB), self.project_dir)
                     
