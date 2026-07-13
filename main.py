@@ -3440,12 +3440,17 @@ class MainWindow(QMainWindow):
         self.btn_ai_verify.clicked.connect(self.run_ai_depth_verification)
         self.btn_ai_verify.setMinimumHeight(35)
         
-        layout_ai.addWidget(self.btn_gen_depth, 0, 0, 1, 2)
-        layout_ai.addWidget(QLabel("Mode:"), 1, 0)
-        layout_ai.addWidget(self.combo_ai_mode, 1, 1)
-        layout_ai.addWidget(self.lbl_ai_blend, 2, 0)
-        layout_ai.addWidget(self.ai_blend_slider, 2, 1)
-        layout_ai.addWidget(self.btn_ai_verify, 3, 0, 1, 2)
+        lbl_ai_warning = QLabel("WARNING: AI Smoothing overrides Planar Constraints!\nUse ONLY for Tripod/Nodal Pan shots where\ntrue 3D depth cannot be solved.")
+        lbl_ai_warning.setStyleSheet("color: #ffaa00; font-weight: bold;")
+        lbl_ai_warning.setAlignment(Qt.AlignCenter)
+        
+        layout_ai.addWidget(lbl_ai_warning, 0, 0, 1, 2)
+        layout_ai.addWidget(self.btn_gen_depth, 1, 0, 1, 2)
+        layout_ai.addWidget(QLabel("Mode:"), 2, 0)
+        layout_ai.addWidget(self.combo_ai_mode, 2, 1)
+        layout_ai.addWidget(self.lbl_ai_blend, 3, 0)
+        layout_ai.addWidget(self.ai_blend_slider, 3, 1)
+        layout_ai.addWidget(self.btn_ai_verify, 4, 0, 1, 2)
         group_ai.setLayout(layout_ai)
         
         # 3. Data Management Group
