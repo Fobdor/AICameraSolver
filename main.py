@@ -2180,6 +2180,11 @@ class ProxyGeoViewport(QWidget):
         self.camera_linesets = []
         self.mesh = None
         
+        self.selected_tracks = []
+        self.selection_point_cloud = None
+        self.user_patches = []
+        self.user_patches_meshes = []
+        
         self.origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0)
         self.origin_scale = 5.0
         self.grid = self.create_grid(size=100, divisions=100)
@@ -2202,6 +2207,15 @@ class ProxyGeoViewport(QWidget):
         self.slider_origin_scale.setValue(50)
         self.slider_origin_scale.valueChanged.connect(self.update_origin_scale)
         self.control_layout.addWidget(self.slider_origin_scale)
+        
+        self.control_layout.addWidget(QLabel("Highlight Size:"))
+        self.slider_highlight_size = QSlider(Qt.Horizontal)
+        self.slider_highlight_size.setRange(1, 200)
+        self.slider_highlight_size.setValue(10)
+        self.slider_highlight_size.valueChanged.connect(self.update_highlight_size)
+        self.control_layout.addWidget(self.slider_highlight_size)
+        
+        self.highlight_size = 0.1
         
         self.control_layout.addStretch()
         self.layout.addWidget(self.control_panel)
@@ -2241,6 +2255,92 @@ class ProxyGeoViewport(QWidget):
         self.vis.poll_events()
         self.vis.update_renderer()
 
+    def set_selected_tracks(self, track_indices):
+        self.selected_tracks = track_indices
+        self.update_selection_highlight()
+        
+    def update_highlight_size(self):
+        self.highlight_size = self.slider_highlight_size.value() / 100.0
+        self.update_selection_highlight()
+
+    def update_selection_highlight(self):
+        if self.selection_point_cloud:
+            self.vis.remove_geometry(self.selection_point_cloud, reset_bounding_box=False)
+            self.selection_point_cloud = None
+            
+        if not self.selected_tracks or not hasattr(self, 'full_points'):
+            self.vis.poll_events()
+            self.vis.update_renderer()
+            return
+            
+        radius = getattr(self, 'highlight_size', 0.1)
+        
+        combined_mesh = o3d.geometry.TriangleMesh()
+        for t_id in self.selected_tracks:
+            if not hasattr(self, 'track_to_compact'): continue
+            compact_id = self.track_to_compact.get(t_id)
+            if compact_id is not None and compact_id < len(self.full_points):
+                pt = self.full_points[compact_id]
+                sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+                sphere.translate(pt)
+                combined_mesh += sphere
+                
+        if len(combined_mesh.vertices) > 0:
+            combined_mesh.paint_uniform_color([1.0, 0.0, 0.0]) # Red
+            self.selection_point_cloud = combined_mesh
+            self.vis.add_geometry(self.selection_point_cloud, reset_bounding_box=False)
+            
+        self.vis.poll_events()
+        self.vis.update_renderer()
+
+    def create_patch_from_selection(self):
+        import scipy.spatial
+        if not self.selected_tracks or not hasattr(self, 'full_points'): return False
+        if len(self.selected_tracks) < 3: return False
+        
+        pts = []
+        for t_id in self.selected_tracks:
+            if not hasattr(self, 'track_to_compact'): continue
+            compact_id = self.track_to_compact.get(t_id)
+            if compact_id is not None and compact_id < len(self.full_points):
+                pts.append(self.full_points[compact_id])
+        pts = np.array(pts)
+        
+        center = np.mean(pts, axis=0)
+        centered = pts - center
+        U, S, Vh = np.linalg.svd(centered)
+        v1 = Vh[0, :]
+        v2 = Vh[1, :]
+        pts_2d = np.column_stack((np.dot(centered, v1), np.dot(centered, v2)))
+        
+        try:
+            tri = scipy.spatial.Delaunay(pts_2d)
+            simplices = tri.simplices
+        except:
+            return False
+            
+        patch_mesh = o3d.geometry.TriangleMesh()
+        patch_mesh.vertices = o3d.utility.Vector3dVector(pts)
+        patch_mesh.triangles = o3d.utility.Vector3iVector(simplices)
+        patch_mesh.compute_vertex_normals()
+        patch_mesh.paint_uniform_color([0.8, 0.2, 0.2])
+        
+        self.user_patches.append(pts)
+        self.user_patches_meshes.append(patch_mesh)
+        
+        self.vis.add_geometry(patch_mesh, reset_bounding_box=False)
+        self.vis.poll_events()
+        self.vis.update_renderer()
+        return True
+
+    def delete_patch(self, idx):
+        if 0 <= idx < len(self.user_patches_meshes):
+            mesh = self.user_patches_meshes.pop(idx)
+            self.user_patches.pop(idx)
+            self.vis.remove_geometry(mesh, reset_bounding_box=False)
+            self.vis.poll_events()
+            self.vis.update_renderer()
+
     def load_solve_data(self, data_path, proxy_res, camera_setup_data):
         if self.point_cloud:
             self.vis.remove_geometry(self.point_cloud)
@@ -2263,10 +2363,13 @@ class ProxyGeoViewport(QWidget):
         self.plate_w = camera_setup_data.get('plate_width', 1920)
         self.plate_h = camera_setup_data.get('plate_height', 1080)
         
-        valid_pts = points_3d[points_mask]
-        if len(valid_pts) > 0:
+        valid_original_indices = np.where(points_mask)[0]
+        self.track_to_compact = {int(orig): compact for compact, orig in enumerate(valid_original_indices)}
+        self.full_points = points_3d[points_mask]
+        
+        if len(self.full_points) > 0:
             self.point_cloud = o3d.geometry.PointCloud()
-            self.point_cloud.points = o3d.utility.Vector3dVector(valid_pts)
+            self.point_cloud.points = o3d.utility.Vector3dVector(self.full_points)
             self.point_cloud.paint_uniform_color([0.8, 0.8, 0.8])
             self.vis.add_geometry(self.point_cloud)
             
@@ -3355,6 +3458,27 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(ctrl_layout)
         
+        patches_layout = QHBoxLayout()
+        self.list_proxy_patches = QListWidget()
+        self.list_proxy_patches.setMaximumHeight(80)
+        
+        patch_btn_layout = QVBoxLayout()
+        self.btn_create_proxy_patch = QPushButton("Create Patch from Selection")
+        self.btn_create_proxy_patch.clicked.connect(self.create_proxy_patch)
+        self.btn_clear_proxy_sel = QPushButton("Clear Selection")
+        self.btn_clear_proxy_sel.clicked.connect(self.clear_proxy_selection)
+        self.btn_delete_proxy_patch = QPushButton("Delete Selected Patch")
+        self.btn_delete_proxy_patch.clicked.connect(self.delete_proxy_patch)
+        
+        patch_btn_layout.addWidget(self.btn_create_proxy_patch)
+        patch_btn_layout.addWidget(self.btn_clear_proxy_sel)
+        patch_btn_layout.addWidget(self.btn_delete_proxy_patch)
+        
+        patches_layout.addWidget(QLabel("Geometry Patches:"))
+        patches_layout.addWidget(self.list_proxy_patches, stretch=1)
+        patches_layout.addLayout(patch_btn_layout)
+        layout.addLayout(patches_layout)
+        
         self.lbl_proxy_geo_status = QLabel("")
         layout.addWidget(self.lbl_proxy_geo_status)
         
@@ -3370,7 +3494,8 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QSplitter
         self.proxy_geo_splitter = QSplitter(Qt.Horizontal)
         
-        self.proxy_geo_2d_viewport = SequenceViewerWidget(self, interactive=False, show_tracks=False)
+        self.proxy_geo_2d_viewport = SequenceViewerWidget(self, interactive=True, show_tracks=True)
+        self.proxy_geo_2d_viewport.trackPicked.connect(self.on_proxy_track_picked)
         self.proxy_geo_3d_viewport = ProxyGeoViewport()
         self.proxy_geo_2d_viewport.slider.valueChanged.connect(self.proxy_geo_3d_viewport.update_active_camera)
         
@@ -3748,16 +3873,21 @@ class MainWindow(QMainWindow):
                 # Update the 2D viewer with the sequence FIRST so it doesn't overwrite our decimated data
                 cs = getattr(self, 'color_space', CS_LINEAR_SRGB)
                 self.solve_2d_viewport.update_sequence(self.exr_files, cs, self.project_dir)
+                self.proxy_geo_2d_viewport.update_sequence(self.exr_files, cs, self.project_dir)
                 
                 self.solve_2d_viewport.track_data = data['tracks_2d']
                 self.solve_2d_viewport.track_vis = data['visibility']
+                self.proxy_geo_2d_viewport.track_data = data['tracks_2d']
+                self.proxy_geo_2d_viewport.track_vis = data['visibility']
                 
                 if 'points_mask' in data and 'points_error' in data:
                     self.solve_2d_points_mask = data['points_mask']
                     self.solve_2d_points_error = data['points_error']
                     self.update_2d_solve_colors()
+                    self.update_proxy_geo_2d_colors()
                     
                 self.solve_2d_viewport.on_frame_changed(0)
+                self.proxy_geo_2d_viewport.on_frame_changed(0)
         except Exception as e:
             print(f"Failed to load 2D solve data: {e}")
 
@@ -3767,7 +3897,64 @@ class MainWindow(QMainWindow):
         else:
             self.selected_tracks.append(track_id)
         self.update_selection_ui()
+
+    def on_proxy_track_picked(self, track_id):
+        if not hasattr(self, 'proxy_selected_tracks'):
+            self.proxy_selected_tracks = []
+        if track_id in self.proxy_selected_tracks:
+            self.proxy_selected_tracks.remove(track_id)
+        else:
+            self.proxy_selected_tracks.append(track_id)
+        self.update_proxy_selection_ui()
         
+    def update_proxy_selection_ui(self):
+        if not hasattr(self, 'proxy_selected_tracks'):
+            self.proxy_selected_tracks = []
+        self.proxy_geo_3d_viewport.set_selected_tracks(self.proxy_selected_tracks)
+        self.update_proxy_geo_2d_colors()
+        
+    def update_proxy_geo_2d_colors(self):
+        if not hasattr(self, 'solve_2d_points_mask') or not hasattr(self, 'solve_2d_points_error'):
+            return
+        threshold = self.solve_viewport.slider_error.value() / 10.0
+        colors = []
+        for i in range(len(self.solve_2d_points_mask)):
+            is_valid = self.solve_2d_points_mask[i]
+            err = self.solve_2d_points_error[i]
+            if i in getattr(self, 'proxy_selected_tracks', []):
+                colors.append(QColor(255, 255, 0, 255)) # Yellow
+            elif is_valid and err <= threshold:
+                colors.append(QColor(0, 255, 0, 200)) # Green
+            else:
+                colors.append(QColor(255, 0, 0, 100)) # Red
+        self.proxy_geo_2d_viewport.track_colors = colors
+        self.proxy_geo_2d_viewport.on_frame_changed(self.proxy_geo_2d_viewport.slider.value())
+
+    def create_proxy_patch(self):
+        if not hasattr(self, 'proxy_selected_tracks') or not self.proxy_selected_tracks:
+            QMessageBox.warning(self, "Warning", "No points selected.")
+            return
+        if len(self.proxy_selected_tracks) < 3:
+            QMessageBox.warning(self, "Warning", "Select at least 3 points.")
+            return
+            
+        success = self.proxy_geo_3d_viewport.create_patch_from_selection()
+        if success:
+            patch_name = f"Patch {self.list_proxy_patches.count() + 1} ({len(self.proxy_selected_tracks)} vertices)"
+            self.list_proxy_patches.addItem(patch_name)
+            self.clear_proxy_selection()
+        else:
+            QMessageBox.critical(self, "Error", "Failed to triangulate points.")
+
+    def clear_proxy_selection(self):
+        self.proxy_selected_tracks = []
+        self.update_proxy_selection_ui()
+
+    def delete_proxy_patch(self):
+        row = self.list_proxy_patches.currentRow()
+        if row >= 0:
+            self.proxy_geo_3d_viewport.delete_patch(row)
+            self.list_proxy_patches.takeItem(row)
     def clear_selection(self):
         self.selected_tracks = []
         self.active_constraint = None
@@ -4426,11 +4613,14 @@ class MainWindow(QMainWindow):
                 self.btn_run_tracking.setEnabled(True)
 
         elif self.tabs.widget(index) == getattr(self, 'proxy_geo_tab', None):
-            self.proxy_geo_2d_viewport.update_sequence(self.exr_files, getattr(self, 'color_space', CS_LINEAR_SRGB), self.project_dir)
             if self.project_dir:
                 solve_path = os.path.join(self.project_dir, 'solve_data.npz')
                 if os.path.exists(solve_path):
+                    self.load_2d_solve_data(solve_path)
                     self.proxy_geo_3d_viewport.load_solve_data(solve_path, self.proxy_res, self.camera_setup_data)
+                else:
+                    self.proxy_geo_2d_viewport.update_sequence(self.exr_files, getattr(self, 'color_space', CS_LINEAR_SRGB), self.project_dir)
+                    
                 mesh_path = os.path.join(self.project_dir, 'proxy_geo.obj')
                 if os.path.exists(mesh_path):
                     self.proxy_geo_3d_viewport.load_proxy_mesh(mesh_path)
